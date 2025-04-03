@@ -2,10 +2,36 @@
 """
 Base Camera Extractor
 Defines the interface for camera-specific EXIF extractors
+Includes optimization utilities for thread parallelism and memory management
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Callable, Tuple
+from enum import Enum
+import os
+import time
+import logging
+import concurrent.futures
+import numpy as np
+import gc
+
+# Import optimization utilities
+from camera_extractors.optimization_utils import (
+    ThreadPoolManager, MemoryTracker, parallel_map, 
+    chunked_processing, set_memory_limit, performance_monitor,
+    safe_array_operation
+)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, 
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('camera_extractor')
+
+
+class ThumbFormat(Enum):
+    """Thumbnail format enum"""
+    JPEG = 'jpeg'
+    TIFF = 'tiff'
 
 
 class CameraExtractor(ABC):
@@ -22,6 +48,67 @@ class CameraExtractor(ABC):
         self.use_gpu = use_gpu
         self.memory_limit = memory_limit
         self.cpu_cores = cpu_cores
+        
+        # Initialize thread pool manager
+        self.thread_pool = ThreadPoolManager(max_workers=cpu_cores)
+        
+        # Set memory limit for the process
+        set_memory_limit(memory_limit)
+        
+        # Performance metrics
+        self.performance_metrics = {}
+        
+    def __del__(self):
+        """Clean up resources when the extractor is deleted"""
+        if hasattr(self, 'thread_pool'):
+            self.thread_pool.shutdown_all()
+            
+    def _time_operation(self, name: str, func: Callable, *args, **kwargs) -> Any:
+        """Time an operation and store the result in performance metrics
+        
+        Args:
+            name: Name of the operation
+            func: Function to call
+            *args: Arguments to pass to the function
+            **kwargs: Keyword arguments to pass to the function
+            
+        Returns:
+            Result of the function call
+        """
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        
+        # Store performance metric
+        self.performance_metrics[name] = end_time - start_time
+        
+        return result
+        
+    def parallel_process(self, func: Callable, items: List[Any]) -> List[Any]:
+        """Process items in parallel using the thread pool
+        
+        Args:
+            func: Function to apply to each item
+            items: List of items to process
+            
+        Returns:
+            List of results
+        """
+        return parallel_map(func, items, max_workers=self.cpu_cores)
+    
+    def process_array_in_chunks(self, array: np.ndarray, func: Callable, 
+                              chunk_size: int = 1024*1024) -> List[Any]:
+        """Process a large array in chunks to limit memory usage
+        
+        Args:
+            array: NumPy array to process
+            func: Function to apply to each chunk
+            chunk_size: Size of each chunk in elements
+            
+        Returns:
+            List of results from each chunk
+        """
+        return chunked_processing(array, func, chunk_size, self.memory_limit)
     
     @abstractmethod
     def can_handle(self, file_ext: str, exif_data: Dict[str, Any]) -> bool:
@@ -82,3 +169,43 @@ class CameraExtractor(ABC):
             Dictionary containing processed thumbnail data, or None
         """
         return None
+        
+    def get_performance_metrics(self) -> Dict[str, float]:
+        """Get performance metrics for this extractor
+        
+        Returns:
+            Dictionary of operation names to execution times in seconds
+        """
+        return self.performance_metrics
+    
+    @performance_monitor
+    def safe_extract_metadata(self, image_path: str, exif_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Memory-safe wrapper for extract_metadata
+        
+        Args:
+            image_path: Path to the image file
+            exif_data: Basic EXIF data already extracted
+            
+        Returns:
+            Dictionary containing the extracted metadata
+        """
+        with MemoryTracker(self.memory_limit) as tracker:
+            return self._time_operation('extract_metadata', 
+                                      self.extract_metadata, 
+                                      image_path, exif_data)
+    
+    @performance_monitor
+    def safe_process_raw(self, image_path: str, exif_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Memory-safe wrapper for process_raw
+        
+        Args:
+            image_path: Path to the image file
+            exif_data: Basic EXIF data already extracted
+            
+        Returns:
+            Dictionary containing the processed RAW data
+        """
+        with MemoryTracker(self.memory_limit) as tracker:
+            return self._time_operation('process_raw', 
+                                      self.process_raw, 
+                                      image_path, exif_data)

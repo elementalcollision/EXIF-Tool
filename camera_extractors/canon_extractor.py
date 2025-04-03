@@ -6,18 +6,33 @@ Provides Canon-specific EXIF extraction for CR2 and CR3 files
 
 import os
 import io
+import time
+import logging
 import subprocess
 import json
 import tempfile
 import numpy as np
 from PIL import Image
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Callable
 
 from .base_extractor import CameraExtractor
+from camera_extractors.optimization_utils import (
+    MemoryTracker, performance_monitor, safe_array_operation
+)
+
+# Configure logging
+logger = logging.getLogger('canon_extractor')
 
 
 class CanonExtractor(CameraExtractor):
     """Canon-specific EXIF extractor for CR2 and CR3 files"""
+    
+    def __init__(self, use_gpu=False, memory_limit=0.75, cpu_cores=None):
+        super().__init__(use_gpu=use_gpu, memory_limit=memory_limit, cpu_cores=cpu_cores)
+        
+        # Log initialization
+        logger.info(f"Initializing CanonExtractor with GPU={use_gpu}, "
+                  f"memory_limit={memory_limit}, cpu_cores={cpu_cores}")
     
     def can_handle(self, file_ext: str, exif_data: Dict[str, Any]) -> bool:
         """Check if this extractor can handle the given file
@@ -31,7 +46,7 @@ class CanonExtractor(CameraExtractor):
         """
         # For CR3 files, always return True since they're Canon-specific
         if file_ext.lower() == '.cr3':
-            print("Detected Canon CR3 file")
+            logger.info("Detected Canon CR3 file")
             return True
             
         # For other Canon RAW formats, check camera make if available
@@ -44,6 +59,7 @@ class CanonExtractor(CameraExtractor):
             
         return is_canon and is_cr_file
     
+    @performance_monitor
     def extract_metadata(self, image_path: str, exif_data: Dict[str, Any]) -> Dict[str, Any]:
         """Extract Canon-specific metadata from the image
         
@@ -54,53 +70,130 @@ class CanonExtractor(CameraExtractor):
         Returns:
             Dictionary containing Canon-specific metadata
         """
-        result = {}
-        file_ext = os.path.splitext(image_path)[1].lower()
-        
-        # Try to extract more metadata using exiftool if available
-        try:
-            if self._check_exiftool():
-                print("Using exiftool to extract Canon metadata")
-                exiftool_data = self._run_exiftool(image_path)
-                if exiftool_data:
-                    # Process Canon-specific tags
-                    for key, value in exiftool_data.items():
-                        if key.startswith('Canon'):
-                            # Convert to snake_case
-                            canon_key = 'canon_' + key[5:].lower().replace(' ', '_')
-                            result[canon_key] = value
+        with MemoryTracker(self.memory_limit) as tracker:
+            start_time = time.time()
+            result = {}
+            file_ext = os.path.splitext(image_path)[1].lower()
+            
+            # Define tasks to run in parallel
+            def extract_exiftool_data():
+                exiftool_result = {}
+                try:
+                    if self._check_exiftool():
+                        logger.info("Using exiftool to extract Canon metadata")
+                        exiftool_data = self._run_exiftool(image_path)
+                        if exiftool_data:
+                            # Process Canon-specific tags
+                            for key, value in exiftool_data.items():
+                                if key.startswith('Canon'):
+                                    # Convert to snake_case
+                                    canon_key = 'canon_' + key[5:].lower().replace(' ', '_')
+                                    exiftool_result[canon_key] = value
+                            
+                            # Extract important Canon metadata
+                            if 'Make' in exiftool_data:
+                                exiftool_result['camera_make'] = exiftool_data['Make']
+                            if 'Model' in exiftool_data:
+                                exiftool_result['camera_model'] = exiftool_data['Model']
+                            if 'DateTimeOriginal' in exiftool_data:
+                                exiftool_result['date_taken'] = exiftool_data['DateTimeOriginal']
+                            if 'ExposureTime' in exiftool_data:
+                                exiftool_result['exposure_time'] = exiftool_data['ExposureTime']
+                            if 'FNumber' in exiftool_data:
+                                exiftool_result['f_number'] = exiftool_data['FNumber']
+                            if 'ISO' in exiftool_data:
+                                exiftool_result['iso'] = exiftool_data['ISO']
+                            if 'FocalLength' in exiftool_data:
+                                exiftool_result['focal_length'] = exiftool_data['FocalLength']
+                            
+                            # Extract CR3-specific metadata
+                            if file_ext == '.cr3':
+                                if 'ImageWidth' in exiftool_data:
+                                    exiftool_result['width'] = exiftool_data['ImageWidth']
+                                if 'ImageHeight' in exiftool_data:
+                                    exiftool_result['height'] = exiftool_data['ImageHeight']
+                                if 'CanonModelID' in exiftool_data:
+                                    exiftool_result['canon_model_id'] = exiftool_data['CanonModelID']
+                                if 'CanonFirmwareVersion' in exiftool_data:
+                                    exiftool_result['canon_firmware'] = exiftool_data['CanonFirmwareVersion']
+                except Exception as e:
+                    logger.error(f"Error extracting Canon metadata with exiftool: {e}")
+                return exiftool_result
+            
+            def extract_model_features():
+                model_result = {}
+                # Add Canon camera model specific features
+                camera_model = exif_data.get('camera_model', '')
+                
+                # Detect Canon camera series
+                if 'EOS' in camera_model:
+                    model_result['canon_camera_series'] = 'EOS'
                     
-                    # Extract important Canon metadata
-                    if 'Make' in exiftool_data:
-                        result['camera_make'] = exiftool_data['Make']
-                    if 'Model' in exiftool_data:
-                        result['camera_model'] = exiftool_data['Model']
-                    if 'DateTimeOriginal' in exiftool_data:
-                        result['date_taken'] = exiftool_data['DateTimeOriginal']
-                    if 'ExposureTime' in exiftool_data:
-                        result['exposure_time'] = exiftool_data['ExposureTime']
-                    if 'FNumber' in exiftool_data:
-                        result['f_number'] = exiftool_data['FNumber']
-                    if 'ISO' in exiftool_data:
-                        result['iso'] = exiftool_data['ISO']
-                    if 'FocalLength' in exiftool_data:
-                        result['focal_length'] = exiftool_data['FocalLength']
-                    
-                    # Extract CR3-specific metadata
-                    if file_ext == '.cr3':
-                        if 'ImageWidth' in exiftool_data:
-                            result['width'] = exiftool_data['ImageWidth']
-                        if 'ImageHeight' in exiftool_data:
-                            result['height'] = exiftool_data['ImageHeight']
-                        if 'CanonModelID' in exiftool_data:
-                            result['canon_model_id'] = exiftool_data['CanonModelID']
-                        if 'CanonFirmwareVersion' in exiftool_data:
-                            result['canon_firmware'] = exiftool_data['CanonFirmwareVersion']
-        except Exception as e:
-            print(f"Error extracting Canon metadata: {e}")
-        
-        return result
+                    # Detect specific EOS models
+                    if any(x in camera_model for x in ['R5', 'R6', 'R3']):
+                        model_result['canon_mirrorless'] = True
+                    if any(x in camera_model for x in ['5D', '1D']):
+                        model_result['canon_professional'] = True
+                    if any(x in camera_model for x in ['90D', '80D', '70D']):
+                        model_result['canon_enthusiast'] = True
+                    if any(x in camera_model for x in ['Rebel', '2000D', '1500D']):
+                        model_result['canon_consumer'] = True
+                elif 'PowerShot' in camera_model:
+                    model_result['canon_camera_series'] = 'PowerShot'
+                    model_result['canon_compact'] = True
+                return model_result
+            
+            def extract_file_metadata():
+                file_result = {}
+                # Add file type
+                file_result['file_type'] = file_ext.upper()[1:]
+                
+                # Get file size
+                try:
+                    file_result['file_size'] = os.path.getsize(image_path)
+                except Exception as e:
+                    logger.error(f"Error getting file size: {e}")
+                
+                return file_result
+            
+            # Execute tasks in parallel
+            with self.thread_pool.get_pool() as executor:
+                exiftool_future = executor.submit(extract_exiftool_data)
+                model_future = executor.submit(extract_model_features)
+                file_future = executor.submit(extract_file_metadata)
+                
+                # Get results
+                try:
+                    exiftool_result = exiftool_future.result()
+                    result.update(exiftool_result)
+                except Exception as e:
+                    logger.error(f"Error in exiftool extraction: {e}")
+                
+                try:
+                    model_result = model_future.result()
+                    result.update(model_result)
+                except Exception as e:
+                    logger.error(f"Error in model features extraction: {e}")
+                
+                try:
+                    file_result = file_future.result()
+                    result.update(file_result)
+                except Exception as e:
+                    logger.error(f"Error in file metadata extraction: {e}")
+            
+            # Count Canon-specific fields
+            canon_fields = [key for key in result.keys() if key.startswith('canon_')]
+            result['canon_field_count'] = len(canon_fields)
+            
+            # Log performance metrics
+            end_time = time.time()
+            memory_used, peak_memory, peak_percentage = tracker.end()
+            logger.info(f"Extracted {len(canon_fields)} Canon-specific fields in {end_time - start_time:.2f} seconds")
+            logger.info(f"Memory usage: {memory_used/(1024*1024):.2f} MB, Peak: {peak_memory/(1024*1024):.2f} MB ({peak_percentage:.1f}%)")
+            
+            return result
     
+    @performance_monitor
     def process_raw(self, image_path: str, exif_data: Dict[str, Any]) -> Dict[str, Any]:
         """Process Canon RAW file data
         
@@ -111,95 +204,204 @@ class CanonExtractor(CameraExtractor):
         Returns:
             Dictionary containing processed Canon RAW data
         """
-        result = {}
-        file_ext = os.path.splitext(image_path)[1].lower()
-        
-        try:
-            print(f"Processing Canon {file_ext} specific data")
+        with MemoryTracker(self.memory_limit) as tracker:
+            start_time = time.time()
+            result = {}
+            file_ext = os.path.splitext(image_path)[1].lower()
+            
+            logger.info(f"Processing Canon {file_ext} specific data")
             
             # CR3 files need special handling
             if file_ext == '.cr3':
-                # Try to extract preview image using exiftool
-                if self._check_exiftool():
-                    preview_path = self._extract_preview(image_path)
-                    if preview_path:
-                        try:
-                            with Image.open(preview_path) as preview:
-                                width, height = preview.size
-                                result['canon_preview_width'] = width
-                                result['canon_preview_height'] = height
-                                result['canon_preview_format'] = preview.format
-                                print(f"Extracted preview image: {width}x{height} {preview.format}")
-                                
-                                # Process preview with GPU if available
-                                if self.use_gpu:
-                                    preview_data = self._process_preview_with_gpu(preview)
-                                    if preview_data:
-                                        result.update(preview_data)
-                        except Exception as preview_error:
-                            print(f"Preview processing error: {preview_error}")
-                        finally:
-                            # Clean up temporary preview file
-                            if os.path.exists(preview_path):
-                                os.remove(preview_path)
+                def process_cr3():
+                    cr3_result = {}
+                    # Try to extract preview image using exiftool
+                    if self._check_exiftool():
+                        preview_path = self._extract_preview(image_path)
+                        if preview_path:
+                            try:
+                                with Image.open(preview_path) as preview:
+                                    width, height = preview.size
+                                    cr3_result['canon_preview_width'] = width
+                                    cr3_result['canon_preview_height'] = height
+                                    cr3_result['canon_preview_format'] = preview.format
+                                    logger.info(f"Extracted preview image: {width}x{height} {preview.format}")
+                                    
+                                    # Process preview with GPU if available
+                                    if self.use_gpu:
+                                        preview_data = self._process_preview_with_gpu(preview)
+                                        if preview_data:
+                                            cr3_result.update(preview_data)
+                            except Exception as e:
+                                logger.error(f"Preview processing error: {e}")
+                            finally:
+                                # Clean up temporary preview file
+                                if os.path.exists(preview_path):
+                                    os.remove(preview_path)
+                    return cr3_result
+                
+                # Execute CR3 processing
+                try:
+                    cr3_result = process_cr3()
+                    result.update(cr3_result)
+                except Exception as e:
+                    logger.error(f"Error processing CR3 file: {e}")
             
             # CR2 files can be processed with rawpy
             elif file_ext == '.cr2':
+                # Define parallel tasks for CR2 processing
+                def extract_basic_metadata(raw):
+                    basic_result = {}
+                    try:
+                        # Get basic metadata
+                        if hasattr(raw, 'color_desc'):
+                            basic_result['canon_color_profile'] = raw.color_desc.decode('utf-8', errors='ignore')
+                        
+                        # Get white balance coefficients if available
+                        if hasattr(raw, 'camera_whitebalance'):
+                            if hasattr(raw.camera_whitebalance, 'tolist'):
+                                basic_result['canon_camera_whitebalance'] = raw.camera_whitebalance.tolist()
+                            else:
+                                basic_result['canon_camera_whitebalance'] = str(raw.camera_whitebalance)
+                        
+                        # Get image dimensions
+                        if hasattr(raw, 'sizes'):
+                            basic_result['canon_full_width'] = raw.sizes.width
+                            basic_result['canon_full_height'] = raw.sizes.height
+                            basic_result['canon_raw_width'] = raw.sizes.raw_width
+                            basic_result['canon_raw_height'] = raw.sizes.raw_height
+                        
+                        # Get black and white levels
+                        basic_result['canon_raw_black_level'] = int(raw.black_level) if hasattr(raw, 'black_level') else 0
+                        basic_result['canon_raw_white_level'] = int(raw.white_level) if hasattr(raw, 'white_level') else 0
+                    except Exception as e:
+                        logger.error(f"Error extracting basic raw metadata: {e}")
+                    return basic_result
+                
+                def extract_raw_stats(raw):
+                    stats_result = {}
+                    try:
+                        with safe_array_operation():
+                            # Get raw image data - use sampling to reduce memory usage
+                            raw_image = raw.raw_image
+                            
+                            # For large images, sample to reduce memory usage
+                            if raw_image.size > 20_000_000:  # For very large sensors
+                                sample_rate = max(1, int(np.sqrt(raw_image.size / 1_000_000)))
+                                sampled_image = raw_image[::sample_rate, ::sample_rate]
+                                logger.info(f"Sampling raw image at 1/{sample_rate} for stats calculation")
+                            else:
+                                sampled_image = raw_image
+                            
+                            # Get basic stats about the raw image
+                            raw_min = np.min(sampled_image)
+                            raw_max = np.max(sampled_image)
+                            
+                            # Record shape and min/max
+                            stats_result['canon_raw_image_shape'] = str(raw_image.shape)
+                            stats_result['canon_raw_min_value'] = int(raw_min)
+                            stats_result['canon_raw_max_value'] = int(raw_max)
+                            
+                            # Calculate histogram with reduced bins for efficiency
+                            histogram, _ = np.histogram(sampled_image.flatten(), bins=256)
+                            
+                            # Calculate basic statistics
+                            stats_result['canon_raw_histogram_mean'] = float(np.mean(histogram))
+                            stats_result['canon_raw_histogram_std'] = float(np.std(histogram))
+                            stats_result['canon_raw_dynamic_range'] = float(np.log2(raw_max - raw_min + 1)) if raw_max > raw_min else 0
+                            
+                            # If GPU is available, do more advanced processing
+                            if self.use_gpu:
+                                try:
+                                    import torch
+                                    if torch.backends.mps.is_available():
+                                        # Convert to tensor and move to GPU
+                                        device = torch.device("mps")
+                                        tensor = torch.tensor(sampled_image, device=device)
+                                        
+                                        # Calculate percentiles for exposure analysis
+                                        percentiles = [1, 5, 10, 50, 90, 95, 99]
+                                        for p in percentiles:
+                                            stats_result[f'canon_raw_percentile_{p}'] = float(torch.quantile(tensor.float(), p/100).cpu().numpy())
+                                        
+                                        # Calculate exposure metrics
+                                        highlight_threshold = 0.95 * raw_max
+                                        shadow_threshold = raw_min + 0.05 * (raw_max - raw_min)
+                                        
+                                        highlight_percentage = (tensor > highlight_threshold).sum().item() / tensor.numel() * 100
+                                        shadow_percentage = (tensor < shadow_threshold).sum().item() / tensor.numel() * 100
+                                        
+                                        stats_result['canon_highlight_percentage'] = round(highlight_percentage, 2)
+                                        stats_result['canon_shadow_percentage'] = round(shadow_percentage, 2)
+                                        stats_result['canon_midtone_percentage'] = round(100 - highlight_percentage - shadow_percentage, 2)
+                                except Exception as e:
+                                    logger.error(f"GPU processing error: {e}")
+                    except Exception as e:
+                        logger.error(f"Error extracting raw stats: {e}")
+                    return stats_result
+                
+                def extract_thumbnail(raw):
+                    thumb_result = {}
+                    try:
+                        thumb = raw.extract_thumb()
+                        if thumb and hasattr(thumb, 'format'):
+                            thumb_result['has_thumbnail'] = True
+                            thumb_result['thumbnail_format'] = thumb.format
+                            logger.info(f"Extracted thumbnail in {thumb.format} format")
+                            
+                            # Process thumbnail if needed
+                            if thumb.format == 'jpeg':
+                                thumbnail_data = self.process_thumbnail(thumb.data, thumb.format)
+                                if thumbnail_data:
+                                    thumb_result.update(thumbnail_data)
+                    except Exception as e:
+                        thumb_result['has_thumbnail'] = False
+                        logger.error(f"Thumbnail extraction error: {e}")
+                    return thumb_result
+                
+                # Process CR2 file with rawpy
                 try:
                     import rawpy
                     with rawpy.imread(image_path) as raw:
-                        # Get raw image data
-                        raw_image = raw.raw_image.copy()
+                        logger.info(f"Processing Canon CR2 file: {image_path}")
                         
-                        # Get basic stats about the raw image
-                        raw_min = np.min(raw_image)
-                        raw_max = np.max(raw_image)
-                        print(f"Raw image shape: {raw_image.shape}")
-                        print(f"Raw image min/max values: {raw_min}/{raw_max}")
-                        
-                        # Calculate histogram
-                        histogram, _ = np.histogram(raw_image.flatten(), bins=256)
-                        
-                        # Canon CR2 specific fields
-                        canon_metadata = {
-                            'canon_raw_image_shape': str(raw_image.shape),
-                            'canon_raw_min_value': int(raw_min),
-                            'canon_raw_max_value': int(raw_max),
-                            'canon_raw_histogram_mean': float(np.mean(histogram)),
-                            'canon_raw_histogram_std': float(np.std(histogram)),
-                            'canon_raw_dynamic_range': float(np.log2(raw_max - raw_min + 1)) if raw_max > raw_min else 0,
-                            'canon_raw_black_level': int(raw.black_level) if hasattr(raw, 'black_level') else 0,
-                            'canon_raw_white_level': int(raw.white_level) if hasattr(raw, 'white_level') else 0
-                        }
-                        
-                        # Add Canon metadata to result
-                        result.update(canon_metadata)
-                        
-                        # Try to extract thumbnail
-                        try:
-                            thumb = raw.extract_thumb()
-                            if thumb and hasattr(thumb, 'format'):
-                                result['has_thumbnail'] = True
-                                result['thumbnail_format'] = thumb.format
-                                print(f"Extracted thumbnail in {thumb.format} format")
-                                
-                                # Process thumbnail if needed
-                                if thumb.format == 'jpeg':
-                                    thumbnail_data = self.process_thumbnail(thumb.data, thumb.format)
-                                    if thumbnail_data:
-                                        result.update(thumbnail_data)
-                        except Exception as thumb_error:
-                            result['has_thumbnail'] = False
-                            print(f"Thumbnail extraction error: {thumb_error}")
+                        # Use thread pool for parallel processing
+                        with self.thread_pool.get_pool() as executor:
+                            # Submit tasks
+                            basic_future = executor.submit(extract_basic_metadata, raw)
+                            stats_future = executor.submit(extract_raw_stats, raw)
+                            thumb_future = executor.submit(extract_thumbnail, raw)
+                            
+                            # Collect results
+                            try:
+                                basic_result = basic_future.result()
+                                result.update(basic_result)
+                            except Exception as e:
+                                logger.error(f"Error getting basic metadata results: {e}")
+                            
+                            try:
+                                stats_result = stats_future.result()
+                                result.update(stats_result)
+                            except Exception as e:
+                                logger.error(f"Error getting raw stats results: {e}")
+                            
+                            try:
+                                thumb_result = thumb_future.result()
+                                result.update(thumb_result)
+                            except Exception as e:
+                                logger.error(f"Error getting thumbnail results: {e}")
                 except ImportError:
-                    print("rawpy not available for CR2 processing")
-                except Exception as cr2_error:
-                    print(f"Canon CR2 processing error: {cr2_error}")
-        
-        except Exception as canon_error:
-            print(f"Canon {file_ext} specific error: {canon_error}")
-        
-        return result
+                    logger.error("rawpy not available for CR2 processing")
+                except Exception as e:
+                    logger.error(f"Canon CR2 processing error: {e}")
+            
+            # Log performance metrics
+            end_time = time.time()
+            memory_used, peak_memory, peak_percentage = tracker.end()
+            logger.info(f"Processed Canon {file_ext} data with {len(result)} attributes in {end_time - start_time:.2f} seconds")
+            logger.info(f"Memory usage: {memory_used/(1024*1024):.2f} MB, Peak: {peak_memory/(1024*1024):.2f} MB ({peak_percentage:.1f}%)")
+            
+            return result
     
     def get_makernote_tags(self) -> Dict[str, str]:
         """Get Canon MakerNote tag mapping

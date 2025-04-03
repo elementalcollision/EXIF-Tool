@@ -298,7 +298,7 @@ class EnhancedExifExtractor:
                 # Import camera extractors here to ensure they're loaded
                 try:
                     from camera_extractors import get_camera_extractor, register_camera_extractor
-                    from camera_extractors import DngExtractor, FujiExtractor, CanonExtractor
+                    from camera_extractors import DngExtractor, FujifilmExtractor, CanonExtractor
                     
                     # Ensure specific extractors are registered for these formats
                     if file_ext.lower() == '.dng':
@@ -441,8 +441,10 @@ class EnhancedExifExtractor:
             if not any(key.startswith('apple_') for key in result.keys()):
                 try:
                     # Get the Apple RAW extractor
-                    apple_extractor = get_camera_extractor('APPLE')
+                    apple_extractor = get_camera_extractor('APPLE', result)
                     if apple_extractor:
+                        # Initialize with GPU settings
+                        apple_extractor.use_gpu = self.use_gpu
                         apple_metadata = apple_extractor.extract_metadata(image_path, result)
                         if apple_metadata:
                             result.update(apple_metadata)

@@ -6,6 +6,7 @@ Provides Apple ProRAW-specific EXIF extraction with support for iPhone models
 
 import os
 import io
+import re
 import numpy as np
 import rawpy
 import json
@@ -19,6 +20,19 @@ from .dng_extractor import DngExtractor
 
 class AppleRawExtractor(DngExtractor):
     """Apple ProRAW-specific EXIF extractor with support for iPhone models"""
+    
+    def __init__(self, use_gpu=False, memory_limit=None, cpu_cores=None):
+        """Initialize the Apple RAW extractor
+        
+        Args:
+            use_gpu: Whether to use GPU acceleration
+            memory_limit: Memory limit in bytes
+            cpu_cores: Number of CPU cores to use
+        """
+        super().__init__(use_gpu=use_gpu)
+        self.is_leica = False  # Initialize is_leica attribute
+        self.memory_limit = memory_limit
+        self.cpu_cores = cpu_cores
     
     def can_handle(self, file_ext: str, exif_data: Dict[str, Any]) -> bool:
         """Check if this extractor can handle the given file
@@ -79,13 +93,48 @@ class AppleRawExtractor(DngExtractor):
                             for cp_key, cp_value in comp_photo.items():
                                 result[f'apple_comp_{cp_key.lower()}'] = cp_value
                     
-                    # Extract HDR information
-                    if 'HDR' in exiftool_data:
-                        result['apple_hdr'] = exiftool_data.get('HDR')
+                    # Extract computational photography features
+                    comp_photo_features = {
+                        'HDR': 'apple_hdr',
+                        'DeepFusion': 'apple_deep_fusion',
+                        'NightMode': 'apple_night_mode',
+                        'SmartHDR': 'apple_smart_hdr',
+                        'PhotonicsEngine': 'apple_photonics_engine',
+                        'LocalToneMapping': 'apple_local_tone_mapping',
+                        'ProRAW': 'apple_proraw_enabled',
+                        'ComputationalPhotography': 'apple_comp_photo_enabled'
+                    }
                     
-                    # Extract Deep Fusion information
-                    if 'DeepFusion' in exiftool_data:
-                        result['apple_deep_fusion'] = exiftool_data.get('DeepFusion')
+                    for feature, field_name in comp_photo_features.items():
+                        if feature in exiftool_data:
+                            result[field_name] = exiftool_data.get(feature)
+                    
+                    # Extract iPhone model-specific features
+                    if 'iPhone' in exif_data.get('camera_model', ''):
+                        model = exif_data.get('camera_model', '')
+                        # Extract model number
+                        if 'iPhone 13' in model:
+                            result['apple_photographic_styles'] = True
+                            result['apple_cinematic_mode'] = True
+                        if 'iPhone 14' in model or 'iPhone 15' in model:
+                            result['apple_photographic_styles'] = True
+                            result['apple_cinematic_mode'] = True
+                            result['apple_action_mode'] = True
+                        if 'Pro' in model:
+                            result['apple_macro_mode'] = True
+                    
+                    # Parse Apple maker notes for additional computational features
+                    if '{MakerApple}' in exiftool_data:
+                        maker_data = exiftool_data.get('{MakerApple}')
+                        if isinstance(maker_data, str):
+                            # Check for known computational photography indicators
+                            if '33 =' in maker_data and 'flags' in maker_data:
+                                result['apple_computational_pipeline'] = True
+                            
+                            # Extract fusion version if available
+                            fusion_match = re.search(r'\d+\.\d+\.\d+', maker_data)
+                            if fusion_match:
+                                result['apple_fusion_version'] = fusion_match.group(0)
         except Exception as e:
             print(f"Error extracting Apple ProRAW metadata: {e}")
         
@@ -150,6 +199,27 @@ class AppleRawExtractor(DngExtractor):
                             result['apple_raw_dynamic_range_r'] = float(np.log2(np.max(rgb[:,:,0]) - np.min(rgb[:,:,0]) + 1))
                             result['apple_raw_dynamic_range_g'] = float(np.log2(np.max(rgb[:,:,1]) - np.min(rgb[:,:,1]) + 1))
                             result['apple_raw_dynamic_range_b'] = float(np.log2(np.max(rgb[:,:,2]) - np.min(rgb[:,:,2]) + 1))
+                            
+                            # Analyze image for computational photography indicators
+                            # Check for noise patterns characteristic of Deep Fusion
+                            noise_levels = [np.std(rgb[i:i+100, j:j+100]) 
+                                           for i in range(0, rgb.shape[0], 100) 
+                                           for j in range(0, rgb.shape[1], 100) 
+                                           if i+100 < rgb.shape[0] and j+100 < rgb.shape[1]]
+                            
+                            if noise_levels:
+                                noise_variance = np.var(noise_levels)
+                                result['apple_noise_variance'] = float(noise_variance)
+                                
+                                # Deep Fusion typically has very consistent noise patterns
+                                if noise_variance < 0.01:
+                                    result['apple_deep_fusion_detected'] = True
+                                
+                                # HDR typically has expanded dynamic range
+                                if result.get('apple_raw_dynamic_range_r', 0) > 14 or \
+                                   result.get('apple_raw_dynamic_range_g', 0) > 14 or \
+                                   result.get('apple_raw_dynamic_range_b', 0) > 14:
+                                    result['apple_hdr_detected'] = True
                             
                             print(f"Processed Apple ProRAW image with dimensions: {rgb.shape}")
                         except Exception as proc_error:

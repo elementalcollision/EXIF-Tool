@@ -82,6 +82,120 @@ import datetime
 import json
 from visualization_engine import EnhancedVisualizer
 
+class AppleProRawPanel(QWidget):
+    """Panel for displaying Apple ProRAW computational photography features"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.init_ui()
+        
+    def init_ui(self):
+        """Initialize the UI components"""
+        layout = QVBoxLayout()
+        
+        # Title and info
+        title_label = QLabel("Apple ProRAW Features")
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        layout.addWidget(title_label)
+        
+        info_label = QLabel("Computational photography features detected in Apple ProRAW files")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # Feature grid layout
+        self.features_layout = QVBoxLayout()
+        
+        # Create feature indicators
+        self.feature_widgets = {}
+        self.create_feature_indicators()
+        
+        # Add features to layout
+        feature_widget = QWidget()
+        feature_widget.setLayout(self.features_layout)
+        layout.addWidget(feature_widget)
+        
+        # Add a spacer at the bottom
+        layout.addStretch(1)
+        
+        self.setLayout(layout)
+    
+    def create_feature_indicators(self):
+        """Create indicators for each computational photography feature"""
+        features = [
+            ("apple_hdr", "HDR", "High Dynamic Range processing"),
+            ("apple_deep_fusion", "Deep Fusion", "Enhanced detail and reduced noise in medium to low light"),
+            ("apple_night_mode", "Night Mode", "Enhanced low-light photography"),
+            ("apple_smart_hdr", "Smart HDR", "Intelligent HDR processing"),
+            ("apple_photonics_engine", "Photonic Engine", "Deep integration of hardware and software"),
+            ("apple_proraw_enabled", "ProRAW", "Apple's RAW format with computational advantages"),
+            ("apple_macro_mode", "Macro Mode", "Close-up photography mode"),
+            ("apple_photographic_styles", "Photographic Styles", "Custom tone and warmth settings"),
+            ("apple_cinematic_mode", "Cinematic Mode", "Depth effects and focus transitions"),
+            ("apple_action_mode", "Action Mode", "Stabilization for moving subjects"),
+            ("apple_hdr_detected", "HDR (Detected)", "HDR detected through image analysis"),
+            ("apple_deep_fusion_detected", "Deep Fusion (Detected)", "Deep Fusion detected through noise analysis")
+        ]
+        
+        for field_name, display_name, description in features:
+            # Create a horizontal layout for each feature
+            feature_layout = QHBoxLayout()
+            
+            # Create indicator label (will show ✓ or ✗)
+            indicator = QLabel("")
+            indicator.setStyleSheet("font-size: 14px; font-weight: bold;")
+            feature_layout.addWidget(indicator, 0)
+            
+            # Create feature name label
+            name_label = QLabel(display_name)
+            name_label.setToolTip(description)
+            feature_layout.addWidget(name_label, 1)
+            
+            # Add to features layout
+            self.features_layout.addLayout(feature_layout)
+            
+            # Store references to the widgets
+            self.feature_widgets[field_name] = (indicator, name_label)
+    
+    def update_panel(self, exif_data):
+        """Update the panel with EXIF data"""
+        # Check if this is an Apple ProRAW file
+        is_proraw = False
+        if exif_data:
+            if exif_data.get('file_type') == 'PRORAW' or \
+               (exif_data.get('camera_make', '').upper() == 'APPLE' and \
+                exif_data.get('file_type', '').upper() == 'DNG'):
+                is_proraw = True
+        
+        # Make the panel visible only for ProRAW files
+        self.setVisible(is_proraw)
+        
+        if not is_proraw:
+            return
+        
+        # Update feature indicators
+        for field_name, (indicator, name_label) in self.feature_widgets.items():
+            if field_name in exif_data and exif_data[field_name]:
+                # Feature is present
+                indicator.setText("✓")
+                indicator.setStyleSheet("color: green; font-size: 14px; font-weight: bold;")
+                name_label.setStyleSheet("font-weight: bold;")
+            else:
+                # Feature is not present
+                indicator.setText("✗")
+                indicator.setStyleSheet("color: gray; font-size: 14px;")
+                name_label.setStyleSheet("color: gray;")
+        
+        # Add any additional Apple-specific data
+        apple_fields = [key for key in exif_data.keys() if key.startswith('apple_')]
+        if apple_fields:
+            # Show the number of Apple-specific fields detected
+            count_label = QLabel(f"Detected {len(apple_fields)} Apple-specific metadata fields")
+            count_label.setStyleSheet("font-style: italic; color: #666;")
+            # Check if we already added this label
+            if not hasattr(self, 'count_label_added') or not self.count_label_added:
+                self.features_layout.addWidget(count_label)
+                self.count_label_added = True
+
 class ExifProcessor:
     """Class for processing EXIF data from photos"""
     
@@ -1444,6 +1558,51 @@ class ExifToolGUI(QMainWindow):
         self.viz_tab.setLayout(viz_layout)
         self.tabs.addTab(self.viz_tab, "Visualizations")
         
+        # Apple ProRAW tab
+        self.proraw_tab = QWidget()
+        proraw_layout = QVBoxLayout()
+        
+        # Add Apple ProRAW panel to the dedicated tab
+        self.apple_panel_main = AppleProRawPanel()
+        proraw_layout.addWidget(self.apple_panel_main)
+        
+        # Add information about Apple ProRAW support
+        info_widget = QWidget()
+        info_layout = QVBoxLayout(info_widget)
+        
+        info_title = QLabel("About Apple ProRAW Support")
+        info_title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        info_layout.addWidget(info_title)
+        
+        info_text = QLabel(
+            "Apple ProRAW combines the benefits of computational photography with RAW. "
+            "This tool extracts Apple-specific metadata including computational photography features "
+            "such as Deep Fusion, Smart HDR, and Night Mode. The panel above shows which features "
+            "were detected in the current image."
+        )
+        info_text.setWordWrap(True)
+        info_layout.addWidget(info_text)
+        
+        compatibility_title = QLabel("Device Compatibility")
+        compatibility_title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        info_layout.addWidget(compatibility_title)
+        
+        compatibility_text = QLabel(
+            "ProRAW is available on iPhone 12 Pro, iPhone 12 Pro Max, and newer Pro models. "
+            "Some computational photography features are specific to certain models."
+        )
+        compatibility_text.setWordWrap(True)
+        info_layout.addWidget(compatibility_text)
+        
+        proraw_layout.addWidget(info_widget)
+        proraw_layout.addStretch(1)
+        
+        self.proraw_tab.setLayout(proraw_layout)
+        self.tabs.addTab(self.proraw_tab, "Apple ProRAW")
+        
+        # Hide the ProRAW tab by default - will show only when a ProRAW file is loaded
+        self.tabs.setTabVisible(3, False)
+        
         main_layout.addWidget(self.tabs)
         
         main_widget.setLayout(main_layout)
@@ -1524,6 +1683,29 @@ class ExifToolGUI(QMainWindow):
             
             status_text = f"Processed {len(exif_data)} images ({cores_info}, {memory_info}, {gpu_info})"
             
+            # Check for Apple ProRAW files
+            has_apple_proraw = False
+            apple_count = 0
+            for item in exif_data:
+                if ('camera_make' in item and str(item['camera_make']).upper() == 'APPLE' and 
+                    'file_type' in item and str(item['file_type']).upper() in ['DNG', 'PRORAW']):
+                    has_apple_proraw = True
+                    apple_count += 1
+                    
+                # Also check for Apple-specific fields
+                apple_fields = [key for key in item.keys() if key.startswith('apple_')]
+                if apple_fields and not has_apple_proraw:
+                    has_apple_proraw = True
+                    apple_count += 1
+            
+            # Show/hide Apple ProRAW tab based on presence of Apple files
+            if hasattr(self, 'proraw_tab') and hasattr(self, 'tabs'):
+                self.tabs.setTabVisible(3, has_apple_proraw)
+                
+                # If we have Apple ProRAW files, add to status text
+                if has_apple_proraw:
+                    status_text += f" | {apple_count} Apple ProRAW files detected"
+            
             # Check if we have normalized fields available
             if self.processor.use_db and self.processor.db:
                 try:
@@ -1562,21 +1744,66 @@ class ExifToolGUI(QMainWindow):
         """Export EXIF data to a CSV file"""
         file_path, _ = QFileDialog.getSaveFileName(self, "Save CSV File", "", "CSV Files (*.csv)")
         if file_path:
-            # Ask if normalized fields should be included
-            include_normalized = True
-            if self.processor.use_db and self.processor.db:
-                msg_box = QMessageBox()
-                msg_box.setWindowTitle("Export Options")
-                msg_box.setText("Include normalized EXIF fields in the export?")
-                msg_box.setInformativeText("Normalized fields provide consistent access to metadata across different camera models.")
-                msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                msg_box.setDefaultButton(QMessageBox.StandardButton.Yes)
-                include_normalized = msg_box.exec() == QMessageBox.StandardButton.Yes
+            # Create export options dialog
+            export_dialog = QDialog(self)
+            export_dialog.setWindowTitle("Export Options")
+            dialog_layout = QVBoxLayout()
+            
+            # Option for normalized fields
+            normalized_checkbox = QCheckBox("Include normalized EXIF fields")
+            normalized_checkbox.setChecked(True)
+            normalized_checkbox.setToolTip("Normalized fields provide consistent access to metadata across different camera models")
+            dialog_layout.addWidget(normalized_checkbox)
+            
+            # Option for Apple ProRAW fields
+            apple_checkbox = QCheckBox("Include Apple ProRAW computational photography fields")
+            apple_checkbox.setChecked(True)
+            apple_checkbox.setToolTip("Include Apple-specific computational photography metadata")
+            dialog_layout.addWidget(apple_checkbox)
+            
+            # Buttons
+            button_layout = QHBoxLayout()
+            ok_button = QPushButton("OK")
+            ok_button.clicked.connect(export_dialog.accept)
+            cancel_button = QPushButton("Cancel")
+            cancel_button.clicked.connect(export_dialog.reject)
+            button_layout.addWidget(ok_button)
+            button_layout.addWidget(cancel_button)
+            dialog_layout.addLayout(button_layout)
+            
+            export_dialog.setLayout(dialog_layout)
+            
+            # Show dialog
+            if export_dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            
+            include_normalized = normalized_checkbox.isChecked()
+            include_apple = apple_checkbox.isChecked()
             
             if self.processor.save_to_csv(file_path, include_normalized=include_normalized):
-                status_msg = f"Exported data to {file_path}"
+                # If we're not including Apple fields, filter them out
+                if not include_apple:
+                    try:
+                        # Read the CSV, filter out Apple fields, and write it back
+                        df = pd.read_csv(file_path)
+                        apple_columns = [col for col in df.columns if col.startswith('apple_')]
+                        if apple_columns:
+                            df = df.drop(columns=apple_columns)
+                            df.to_csv(file_path, index=False)
+                    except Exception as e:
+                        print(f"Warning: Could not filter Apple fields: {e}")
+                
+                # Update status message
+                status_parts = []
                 if include_normalized:
-                    status_msg += " (with normalized fields)"
+                    status_parts.append("normalized fields")
+                if include_apple:
+                    status_parts.append("Apple ProRAW fields")
+                
+                status_msg = f"Exported data to {file_path}"
+                if status_parts:
+                    status_msg += f" (with {' and '.join(status_parts)})"
+                
                 self.status_label.setText(status_msg)
                 QMessageBox.information(self, "Success", status_msg)
             else:
@@ -1614,11 +1841,49 @@ class ExifToolGUI(QMainWindow):
         self.data_table.setColumnCount(len(all_columns))
         self.data_table.setHorizontalHeaderLabels(all_columns)
         
+        # Check if any Apple ProRAW files are present
+        has_apple_proraw = False
+        apple_fields = []
+        
+        # Collect all Apple-specific fields
+        for i, row in df.iterrows():
+            # Check for Apple ProRAW files
+            if ('camera_make' in row and str(row['camera_make']).upper() == 'APPLE' and 
+                'file_type' in row and str(row['file_type']).upper() in ['DNG', 'PRORAW']):
+                has_apple_proraw = True
+            
+            # Collect Apple-specific fields
+            for col in regular_columns:
+                if col.startswith('apple_') and col not in apple_fields:
+                    apple_fields.append(col)
+                    has_apple_proraw = True
+        
+        # Show/hide Apple ProRAW tab based on presence of Apple files
+        if hasattr(self, 'proraw_tab') and hasattr(self, 'tabs'):
+            self.tabs.setTabVisible(3, has_apple_proraw)
+            
+            # Update the Apple ProRAW panel if we have one
+            if has_apple_proraw and hasattr(self, 'apple_panel_main'):
+                # Get the first Apple ProRAW file's data for the panel
+                for i, row in df.iterrows():
+                    if ('camera_make' in row and str(row['camera_make']).upper() == 'APPLE' and 
+                        'file_type' in row and str(row['file_type']).upper() in ['DNG', 'PRORAW']):
+                        # Convert row to dict for the panel
+                        row_dict = row.to_dict()
+                        self.apple_panel_main.update_panel(row_dict)
+                        break
+        
         # Fill table with data
         for i, row in df.iterrows():
             # Regular columns
             for j, col in enumerate(regular_columns):
                 item = QTableWidgetItem(str(row[col]))
+                
+                # Highlight Apple-specific fields
+                if col.startswith('apple_'):
+                    item.setBackground(Qt.GlobalColor.lightGray)
+                    item.setToolTip("Apple ProRAW specific field")
+                
                 self.data_table.setItem(i, j, item)
             
             # Normalized columns if available
