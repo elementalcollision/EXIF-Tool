@@ -6,6 +6,10 @@ Tests extraction of camera-specific metadata from various RAW formats
 
 import os
 import sys
+
+# Add the parent directory to the Python path to find modules
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import json
 from typing import Dict, Any, List
 from exif_extractor import EnhancedExifExtractor
@@ -109,6 +113,40 @@ def test_file(image_path: str, use_gpu: bool = False) -> Dict[str, Any]:
         # Extract metadata with the specific extractor
         specific_data = {}
         try:
+            # Test error handling by first trying with a corrupted copy of the file
+            print("\n--- Testing error handling with corrupted file ---")
+            # Create a temporary corrupted copy of the file for testing error handling
+            import tempfile
+            import shutil
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as temp_file:
+                corrupted_path = temp_file.name
+                # Copy only the first 10KB of the file to create a corrupted version
+                with open(image_path, 'rb') as src_file:
+                    temp_file.write(src_file.read(10240))
+            
+            try:
+                print(f"Testing error handling with truncated file: {os.path.basename(corrupted_path)}")
+                # This should trigger the error handling in the extractor
+                corrupt_data = specific_extractor.extract_metadata(corrupted_path, exif_data)
+                print(f"Extractor handled corrupted file gracefully: {bool(corrupt_data)}")
+                
+                # Test process_raw with corrupted file
+                try:
+                    corrupt_raw_data = specific_extractor.process_raw(corrupted_path, exif_data)
+                    print(f"process_raw handled corrupted file gracefully: {bool(corrupt_raw_data)}")
+                except Exception as raw_error:
+                    print(f"Expected error in process_raw with corrupted file: {raw_error}")
+            except Exception as corrupt_error:
+                print(f"Error with corrupted file (expected): {corrupt_error}")
+            finally:
+                # Clean up the temporary file
+                try:
+                    os.unlink(corrupted_path)
+                except:
+                    pass
+            
+            # Now test with the actual file
+            print("\n--- Testing with actual file ---")
             specific_data = specific_extractor.extract_metadata(image_path, exif_data)
             specific_time = time.time() - start_time
             print(f"Specific extraction time: {specific_time:.2f} seconds")

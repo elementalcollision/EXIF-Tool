@@ -198,7 +198,12 @@ class SonyExtractor(CameraExtractor):
                     
                     # Get white balance coefficients if available
                     if hasattr(raw, 'camera_whitebalance'):
-                        basic_result['camera_white_balance'] = raw.camera_whitebalance.tolist()
+                        # Check if it's a NumPy array (has tolist method) or already a list
+                        if hasattr(raw.camera_whitebalance, 'tolist'):
+                            basic_result['camera_white_balance'] = raw.camera_whitebalance.tolist()
+                        else:
+                            # If it's already a list or another type, use it directly
+                            basic_result['camera_white_balance'] = raw.camera_whitebalance
                     
                     # Get raw image size
                     if hasattr(raw, 'sizes'):

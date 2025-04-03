@@ -440,17 +440,35 @@ class EnhancedExifExtractor:
             # Try to extract Apple-specific metadata if not already done
             if not any(key.startswith('apple_') for key in result.keys()):
                 try:
-                    # Get the Apple RAW extractor
-                    apple_extractor = get_camera_extractor('APPLE', result)
+                    # Get the Apple RAW extractor with robust error handling
+                    apple_extractor = get_camera_extractor('APPLE', result, 
+                                                          use_gpu=self.use_gpu,
+                                                          memory_limit=0.75,
+                                                          cpu_cores=self.cpu_cores)
                     if apple_extractor:
-                        # Initialize with GPU settings
-                        apple_extractor.use_gpu = self.use_gpu
-                        apple_metadata = apple_extractor.extract_metadata(image_path, result)
-                        if apple_metadata:
-                            result.update(apple_metadata)
-                            print(f"Added {len(apple_metadata)} Apple-specific fields")
+                        # Extract metadata with robust error handling
+                        try:
+                            # Initialize with GPU settings
+                            apple_extractor.use_gpu = self.use_gpu
+                            apple_metadata = apple_extractor.extract_metadata(image_path, result)
+                            if apple_metadata:
+                                result.update(apple_metadata)
+                                print(f"Added {len(apple_metadata)} Apple-specific fields")
+                        except Exception as metadata_error:
+                            print(f"Error extracting Apple ProRAW metadata: {metadata_error}")
+                            # Continue processing even if metadata extraction fails
+                        
+                        # Process RAW data with robust error handling
+                        try:
+                            raw_data = apple_extractor.process_raw(image_path, result)
+                            if raw_data:
+                                result.update(raw_data)
+                                print(f"Added {len(raw_data)} fields from Apple ProRAW processing")
+                        except Exception as raw_error:
+                            print(f"Error processing Apple ProRAW data: {raw_error}")
+                            # Continue with other extraction methods even if RAW processing fails
                 except Exception as apple_error:
-                    print(f"Error extracting Apple ProRAW metadata: {apple_error}")
+                    print(f"Error initializing Apple ProRAW extractor: {apple_error}")
         
         print(f"Extracted {len(result)} fields")
         return result

@@ -430,30 +430,42 @@ class ExifProcessor:
                             'camera_model': camera_model
                         }
                         
-                        # Get appropriate camera extractor
-                        camera_extractor = get_camera_extractor(
-                            file_ext=file_ext,
-                            exif_data=basic_exif,
-                            use_gpu=GPU_AVAILABLE,
-                            memory_limit=0.75,  # Use 75% of available memory
-                            cpu_cores=None  # Use default (n-2 on Apple Silicon)
-                        )
-                        
-                        if camera_extractor:
-                            print(f"Using camera-specific extractor for {file_ext}")
-                            # Extract metadata using the camera-specific extractor
-                            camera_metadata = camera_extractor.extract_metadata(image_path, basic_exif)
-                            if camera_metadata:
-                                for key, value in camera_metadata.items():
-                                    exif_fields[key] = value
-                                print(f"Added {len(camera_metadata)} fields from camera-specific extractor")
+                        # Get appropriate camera extractor with robust error handling
+                        try:
+                            camera_extractor = get_camera_extractor(
+                                file_ext=file_ext,
+                                exif_data=basic_exif,
+                                use_gpu=GPU_AVAILABLE,
+                                memory_limit=0.75,  # Use 75% of available memory
+                                cpu_cores=None  # Use default (n-2 on Apple Silicon)
+                            )
                             
-                            # Process RAW data
-                            raw_data = camera_extractor.process_raw(image_path, basic_exif)
-                            if raw_data:
-                                for key, value in raw_data.items():
-                                    exif_fields[key] = value
-                                print(f"Added {len(raw_data)} fields from RAW processing")
+                            if camera_extractor:
+                                print(f"Using camera-specific extractor for {file_ext}")
+                                
+                                # Extract metadata using the camera-specific extractor with error handling
+                                try:
+                                    camera_metadata = camera_extractor.extract_metadata(image_path, basic_exif)
+                                    if camera_metadata:
+                                        for key, value in camera_metadata.items():
+                                            exif_fields[key] = value
+                                        print(f"Added {len(camera_metadata)} fields from camera-specific extractor")
+                                except Exception as metadata_error:
+                                    print(f"Error extracting camera metadata: {metadata_error}")
+                                    # Continue with processing even if metadata extraction fails
+                                
+                                # Process RAW data with robust error handling
+                                try:
+                                    raw_data = camera_extractor.process_raw(image_path, basic_exif)
+                                    if raw_data:
+                                        for key, value in raw_data.items():
+                                            exif_fields[key] = value
+                                        print(f"Added {len(raw_data)} fields from RAW processing")
+                                except Exception as raw_error:
+                                    print(f"Error processing RAW data: {raw_error}")
+                                    # Continue with other extraction methods even if RAW processing fails
+                        except Exception as extractor_init_error:
+                            print(f"Error initializing camera extractor: {extractor_init_error}")
                     except Exception as extractor_error:
                         print(f"Camera extractor error: {extractor_error}")
                     
