@@ -2,7 +2,7 @@
 """
 Enhanced EXIF extractor module for the EXIF tool
 This module provides improved EXIF extraction capabilities
-with special handling for Sony ARW files
+with modular support for different camera types
 """
 
 import os
@@ -15,6 +15,7 @@ import warnings
 import numpy as np
 import rawpy
 from PIL import Image, ImageFile
+from camera_extractors import get_camera_extractor
 
 # Disable DecompressionBombWarning
 Image.MAX_IMAGE_PIXELS = None
@@ -288,106 +289,76 @@ class EnhancedExifExtractor:
         except Exception as e:
             print(f"ExifRead error: {e}")
         
-        # Method 3: RAW processing for RAW files
+        # Method 3: RAW processing for RAW files using camera-specific extractors
         if file_ext.lower() in ['.arw', '.nef', '.cr2', '.orf', '.rw2', '.raw']:
             try:
                 print(f"Processing RAW file: {file_ext}")
-                with rawpy.imread(image_path) as raw:
-                    # Extract basic RAW metadata
-                    raw_metadata = {
-                        'raw_type': str(raw.raw_type),
-                        'raw_pattern': str(raw.raw_pattern.tolist()) if hasattr(raw, 'raw_pattern') else None,
-                        'black_level': str(raw.black_level) if hasattr(raw, 'black_level') else None,
-                        'white_level': str(raw.white_level) if hasattr(raw, 'white_level') else None,
-                        'color_desc': raw.color_desc.decode('utf-8', errors='ignore') if hasattr(raw, 'color_desc') else None,
-                        'num_colors': raw.num_colors if hasattr(raw, 'num_colors') else None,
-                        'raw_height': raw.sizes.raw_height if hasattr(raw, 'sizes') else None,
-                        'raw_width': raw.sizes.raw_width if hasattr(raw, 'sizes') else None
-                    }
+                
+                # First, try to get a camera-specific extractor
+                camera_extractor = get_camera_extractor(
+                    file_ext=file_ext,
+                    exif_data=result,
+                    use_gpu=self.use_gpu,
+                    memory_limit=self.memory_limit / self.total_memory,
+                    cpu_cores=self.cpu_cores
+                )
+                
+                # If we have a camera-specific extractor, use it
+                if camera_extractor:
+                    # Extract camera-specific metadata
+                    camera_metadata = camera_extractor.extract_metadata(image_path, result)
+                    if camera_metadata:
+                        result.update(camera_metadata)
                     
-                    # Update dimensions if not already set
-                    if 'width' not in result or result['width'] == 0:
-                        result['width'] = raw.sizes.width if hasattr(raw, 'sizes') else 0
-                        result['height'] = raw.sizes.height if hasattr(raw, 'sizes') else 0
-                        result['aspect_ratio'] = round(result['width'] / result['height'], 2) if result['height'] > 0 else 0
-                        print(f"RAW dimensions: {result['width']}x{result['height']}")
+                    # Process RAW data
+                    raw_data = camera_extractor.process_raw(image_path, result)
+                    if raw_data:
+                        result.update(raw_data)
                     
-                    # Add RAW metadata to result
-                    for key, value in raw_metadata.items():
-                        if value is not None:
-                            result[key] = value
-                    
-                    # Special processing for Sony ARW files
-                    if file_ext.lower() == '.arw':
-                        try:
-                            print("Processing Sony ARW specific data")
-                            # Get raw image data
-                            raw_image = raw.raw_image.copy()
-                            
-                            # Get basic stats about the raw image
-                            raw_min = np.min(raw_image)
-                            raw_max = np.max(raw_image)
-                            print(f"Raw image shape: {raw_image.shape}")
-                            print(f"Raw image min/max values: {raw_min}/{raw_max}")
-                            
-                            # Calculate histogram
-                            histogram, _ = np.histogram(raw_image.flatten(), bins=256)
-                            
-                            # Sony ARW specific fields
-                            sony_metadata = {
-                                'sony_arw_version': 'ARW 2.0' if str(raw.raw_type) == 'RawType.Flat' else 'ARW 1.0',
-                                'sony_raw_image_shape': str(raw_image.shape),
-                                'sony_raw_min_value': int(raw_min),
-                                'sony_raw_max_value': int(raw_max),
-                                'sony_raw_histogram_mean': float(np.mean(histogram)),
-                                'sony_raw_histogram_std': float(np.std(histogram)),
-                                'sony_raw_dynamic_range': float(np.log2(raw_max - raw_min + 1)) if raw_max > raw_min else 0,
-                                'sony_raw_black_level': int(raw.black_level) if hasattr(raw, 'black_level') else 0,
-                                'sony_raw_white_level': int(raw.white_level) if hasattr(raw, 'white_level') else 0
-                            }
-                            
-                            # Add Sony metadata to result
-                            for key, value in sony_metadata.items():
+                    # Add any MakerNote tags to the tag mapping
+                    makernote_tags = camera_extractor.get_makernote_tags()
+                    if makernote_tags and tags:  # tags from exifread
+                        for tag, field in makernote_tags.items():
+                            if tag in tags:
+                                result[field] = str(tags[tag])
+                
+                # If no camera-specific extractor or as a fallback, use generic RAW processing
+                else:
+                    with rawpy.imread(image_path) as raw:
+                        # Extract basic RAW metadata
+                        raw_metadata = {
+                            'raw_type': str(raw.raw_type),
+                            'raw_pattern': str(raw.raw_pattern.tolist()) if hasattr(raw, 'raw_pattern') else None,
+                            'black_level': str(raw.black_level) if hasattr(raw, 'black_level') else None,
+                            'white_level': str(raw.white_level) if hasattr(raw, 'white_level') else None,
+                            'color_desc': raw.color_desc.decode('utf-8', errors='ignore') if hasattr(raw, 'color_desc') else None,
+                            'num_colors': raw.num_colors if hasattr(raw, 'num_colors') else None,
+                            'raw_height': raw.sizes.raw_height if hasattr(raw, 'sizes') else None,
+                            'raw_width': raw.sizes.raw_width if hasattr(raw, 'sizes') else None
+                        }
+                        
+                        # Update dimensions if not already set
+                        if 'width' not in result or result['width'] == 0:
+                            result['width'] = raw.sizes.width if hasattr(raw, 'sizes') else 0
+                            result['height'] = raw.sizes.height if hasattr(raw, 'sizes') else 0
+                            result['aspect_ratio'] = round(result['width'] / result['height'], 2) if result['height'] > 0 else 0
+                            print(f"RAW dimensions: {result['width']}x{result['height']}")
+                        
+                        # Add RAW metadata to result
+                        for key, value in raw_metadata.items():
+                            if value is not None:
                                 result[key] = value
-                            
-                            # Try to extract thumbnail
-                            try:
-                                thumb = raw.extract_thumb()
-                                if thumb and hasattr(thumb, 'format'):
-                                    result['has_thumbnail'] = True
-                                    result['thumbnail_format'] = thumb.format
-                                    print(f"Extracted thumbnail in {thumb.format} format")
-                                    
-                                    # If using GPU acceleration, process the thumbnail
-                                    if self.use_gpu and 'thumbnail_format' in result and result['thumbnail_format'] == 'jpeg':
-                                        try:
-                                            import torch
-                                            if torch.backends.mps.is_available():
-                                                print("Processing thumbnail with Metal GPU acceleration")
-                                                # Convert thumbnail to tensor and process with Metal
-                                                with Image.open(io.BytesIO(thumb.data)) as pil_thumb:
-                                                    # Get thumbnail dimensions
-                                                    thumb_width, thumb_height = pil_thumb.size
-                                                    result['thumbnail_width'] = thumb_width
-                                                    result['thumbnail_height'] = thumb_height
-                                                    print(f"Thumbnail dimensions: {thumb_width}x{thumb_height}")
-                                        except Exception as gpu_error:
-                                            print(f"GPU processing error: {gpu_error}")
-                            except Exception as thumb_error:
-                                result['has_thumbnail'] = False
-                                print(f"Thumbnail extraction error: {thumb_error}")
-                            
-                            # Try to get color profile information
-                            if hasattr(raw, 'color_desc'):
-                                result['sony_color_profile'] = raw.color_desc.decode('utf-8', errors='ignore')
-                                print(f"Color profile: {result['sony_color_profile']}")
-                            
-                            # Try to get camera white balance coefficients
-                            if hasattr(raw, 'camera_whitebalance'):
-                                result['sony_camera_whitebalance'] = str(raw.camera_whitebalance)
-                                print(f"Camera white balance: {result['sony_camera_whitebalance']}")
-                        except Exception as sony_error:
-                            print(f"Sony ARW specific error: {sony_error}")
+                        
+                        # Try to extract thumbnail
+                        try:
+                            thumb = raw.extract_thumb()
+                            if thumb and hasattr(thumb, 'format'):
+                                result['has_thumbnail'] = True
+                                result['thumbnail_format'] = thumb.format
+                                print(f"Extracted thumbnail in {thumb.format} format")
+                        except Exception as thumb_error:
+                            result['has_thumbnail'] = False
+                            print(f"Thumbnail extraction error: {thumb_error}")
             except Exception as raw_error:
                 print(f"RAW processing error: {raw_error}")
         
