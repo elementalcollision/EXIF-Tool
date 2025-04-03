@@ -80,12 +80,13 @@ from matplotlib.figure import Figure
 from tqdm import tqdm
 import datetime
 import json
+from visualization_engine import EnhancedVisualizer
 
 class ExifProcessor:
     """Class for processing EXIF data from photos"""
     
     def __init__(self, use_db=True, db_path=None):
-        self.supported_extensions = ['.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic', '.heif', '.nef', '.cr2', '.arw']
+        self.supported_extensions = ['.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic', '.heif', '.nef', '.cr2', '.cr3', '.arw', '.dng', '.raf']
         self.exif_data = []
         self.csv_path = None
         self.use_db = use_db
@@ -296,11 +297,53 @@ class ExifProcessor:
             except Exception as cv_error:
                 print(f"OpenCV error: {cv_error}")
                 
-            # Method 4: Specialized RAW file processing (especially for Sony ARW)
+            # Method 4: Specialized RAW file processing for all supported RAW formats
             file_ext = os.path.splitext(image_path)[1].lower()
-            if file_ext in ['.arw', '.raw', '.nef', '.cr2', '.orf', '.rw2']:
+            if file_ext in ['.arw', '.raw', '.nef', '.cr2', '.cr3', '.orf', '.rw2', '.dng', '.raf']:
                 try:
                     print(f"Processing RAW file: {file_ext}")
+                    
+                    # First, try to use camera-specific extractors
+                    try:
+                        from camera_extractors import get_camera_extractor
+                        
+                        # Create a basic exif_data dictionary to pass to the extractor
+                        basic_exif = {
+                            'file_path': image_path,
+                            'file_name': os.path.basename(image_path),
+                            'file_type': file_ext.lstrip('.').upper(),
+                            'camera_make': camera_make,
+                            'camera_model': camera_model
+                        }
+                        
+                        # Get appropriate camera extractor
+                        camera_extractor = get_camera_extractor(
+                            file_ext=file_ext,
+                            exif_data=basic_exif,
+                            use_gpu=GPU_AVAILABLE,
+                            memory_limit=0.75,  # Use 75% of available memory
+                            cpu_cores=None  # Use default (n-2 on Apple Silicon)
+                        )
+                        
+                        if camera_extractor:
+                            print(f"Using camera-specific extractor for {file_ext}")
+                            # Extract metadata using the camera-specific extractor
+                            camera_metadata = camera_extractor.extract_metadata(image_path, basic_exif)
+                            if camera_metadata:
+                                for key, value in camera_metadata.items():
+                                    exif_fields[key] = value
+                                print(f"Added {len(camera_metadata)} fields from camera-specific extractor")
+                            
+                            # Process RAW data
+                            raw_data = camera_extractor.process_raw(image_path, basic_exif)
+                            if raw_data:
+                                for key, value in raw_data.items():
+                                    exif_fields[key] = value
+                                print(f"Added {len(raw_data)} fields from RAW processing")
+                    except Exception as extractor_error:
+                        print(f"Camera extractor error: {extractor_error}")
+                    
+                    # Fallback to generic rawpy processing
                     with rawpy.imread(image_path) as raw:
                         # Extract basic RAW metadata
                         raw_metadata = {
@@ -433,12 +476,13 @@ class ExifProcessor:
             except:
                 return None
     
-    def save_to_csv(self, output_path, collection_id=None):
+    def save_to_csv(self, output_path, collection_id=None, include_normalized=True):
         """Save EXIF data to a CSV file
         
         Args:
             output_path: Path to save the CSV file
             collection_id: Optional collection ID to filter images
+            include_normalized: Whether to include normalized EXIF fields
             
         Returns:
             True if successful, False otherwise
@@ -447,8 +491,10 @@ class ExifProcessor:
             # If using database, export directly from database
             if self.use_db and self.db:
                 try:
-                    self.db.export_to_csv(output_path, collection_id)
+                    self.db.export_to_csv(output_path, collection_id, include_normalized=include_normalized)
                     print(f"Exported EXIF data from database to {output_path}")
+                    if include_normalized:
+                        print("Normalized EXIF fields included in export")
                     self.csv_path = output_path
                     return True
                 except Exception as db_error:
@@ -1264,6 +1310,13 @@ class ExifToolGUI(QMainWindow):
         self.gpu_image_processing = GPU_AVAILABLE
         self.gpu_data_analysis = GPU_AVAILABLE
         
+        # Initialize enhanced visualizer with GPU acceleration if available
+        self.visualizer = EnhancedVisualizer(
+            use_gpu=self.use_gpu,
+            memory_limit=self.memory_limit,
+            cpu_cores=self.cpu_cores
+        )
+        
         self.init_ui()
     
     def init_ui(self):
@@ -1334,6 +1387,7 @@ class ExifToolGUI(QMainWindow):
         self.viz_tab = QWidget()
         viz_layout = QVBoxLayout()
         
+        # Visualization type selector
         viz_controls = QHBoxLayout()
         self.viz_type_combo = QComboBox()
         self.viz_type_combo.addItems([
@@ -1341,14 +1395,49 @@ class ExifToolGUI(QMainWindow):
             "Focal Length Distribution",
             "Aperture Distribution",
             "ISO Distribution",
-            "Time of Day Distribution"
+            "Time of Day Distribution",
+            "Location Map",
+            "Aperture vs Focal Length",
+            "ISO vs Time of Day"
         ])
         self.viz_type_combo.currentIndexChanged.connect(self.update_visualization)
         viz_controls.addWidget(QLabel("Visualization:"))
         viz_controls.addWidget(self.viz_type_combo)
         viz_layout.addLayout(viz_controls)
         
-        self.figure = Figure(figsize=(10, 8))
+        # Additional visualization controls
+        viz_options = QHBoxLayout()
+        
+        # GPU acceleration toggle
+        self.gpu_viz_checkbox = QCheckBox("Use GPU")
+        self.gpu_viz_checkbox.setChecked(self.use_gpu)
+        self.gpu_viz_checkbox.setToolTip("Toggle GPU acceleration for visualizations")
+        self.gpu_viz_checkbox.stateChanged.connect(self.toggle_gpu_visualization)
+        viz_options.addWidget(self.gpu_viz_checkbox)
+        
+        # Refresh button
+        self.refresh_viz_btn = QPushButton("Refresh")
+        self.refresh_viz_btn.clicked.connect(self.update_visualization)
+        viz_options.addWidget(self.refresh_viz_btn)
+        
+        # Clear cache button
+        self.clear_cache_btn = QPushButton("Clear Cache")
+        self.clear_cache_btn.clicked.connect(self.clear_visualization_cache)
+        viz_options.addWidget(self.clear_cache_btn)
+        
+        # Export visualization button
+        self.export_viz_btn = QPushButton("Export Plot")
+        self.export_viz_btn.clicked.connect(self.export_visualization)
+        viz_options.addWidget(self.export_viz_btn)
+        
+        viz_layout.addLayout(viz_options)
+        
+        # Performance indicator
+        self.viz_perf_label = QLabel("")
+        viz_layout.addWidget(self.viz_perf_label)
+        
+        # Matplotlib figure with higher DPI for better quality
+        self.figure = Figure(figsize=(10, 8), dpi=100)
         self.canvas = FigureCanvas(self.figure)
         viz_layout.addWidget(self.canvas)
         
@@ -1433,7 +1522,19 @@ class ExifToolGUI(QMainWindow):
             memory_info = f"Memory limit: {int(self.memory_limit * 100)}%" if self.memory_limit else "No memory limit"
             gpu_info = "GPU: Enabled" if self.use_gpu else "GPU: Disabled"
             
-            self.status_label.setText(f"Processed {len(exif_data)} images ({cores_info}, {memory_info}, {gpu_info})")
+            status_text = f"Processed {len(exif_data)} images ({cores_info}, {memory_info}, {gpu_info})"
+            
+            # Check if we have normalized fields available
+            if self.processor.use_db and self.processor.db:
+                try:
+                    normalized_fields = self.processor.db.get_available_normalized_fields()
+                    if normalized_fields:
+                        status_text += f" | {len(normalized_fields)} normalized fields available"
+                        print(f"Normalized EXIF fields available: {', '.join(normalized_fields)}")
+                except Exception as e:
+                    print(f"Error checking normalized fields: {e}")
+            
+            self.status_label.setText(status_text)
             
             self.processor.exif_data = exif_data
             self.analyzer.set_data(exif_data)
@@ -1461,9 +1562,23 @@ class ExifToolGUI(QMainWindow):
         """Export EXIF data to a CSV file"""
         file_path, _ = QFileDialog.getSaveFileName(self, "Save CSV File", "", "CSV Files (*.csv)")
         if file_path:
-            if self.processor.save_to_csv(file_path):
-                self.status_label.setText(f"Exported data to {file_path}")
-                QMessageBox.information(self, "Success", f"Data exported to {file_path}")
+            # Ask if normalized fields should be included
+            include_normalized = True
+            if self.processor.use_db and self.processor.db:
+                msg_box = QMessageBox()
+                msg_box.setWindowTitle("Export Options")
+                msg_box.setText("Include normalized EXIF fields in the export?")
+                msg_box.setInformativeText("Normalized fields provide consistent access to metadata across different camera models.")
+                msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                msg_box.setDefaultButton(QMessageBox.StandardButton.Yes)
+                include_normalized = msg_box.exec() == QMessageBox.StandardButton.Yes
+            
+            if self.processor.save_to_csv(file_path, include_normalized=include_normalized):
+                status_msg = f"Exported data to {file_path}"
+                if include_normalized:
+                    status_msg += " (with normalized fields)"
+                self.status_label.setText(status_msg)
+                QMessageBox.information(self, "Success", status_msg)
             else:
                 QMessageBox.warning(self, "Error", "Failed to export CSV file")
     
@@ -1474,16 +1589,50 @@ class ExifToolGUI(QMainWindow):
         if df.empty:
             return
         
+        # Check if we have normalized EXIF data to display
+        has_normalized = False
+        normalized_columns = []
+        
+        if 'normalized' in df.columns:
+            has_normalized = True
+            # Extract normalized fields from the first row that has them
+            for i, row in df.iterrows():
+                if pd.notna(row['normalized']) and isinstance(row['normalized'], dict):
+                    normalized_columns = list(row['normalized'].keys())
+                    break
+        
+        # Prepare columns - regular columns plus normalized ones
+        regular_columns = [col for col in df.columns if col != 'normalized']
+        all_columns = regular_columns.copy()
+        
+        if has_normalized and normalized_columns:
+            # Add normalized columns with a prefix
+            all_columns.extend([f"norm_{col}" for col in normalized_columns])
+        
         # Set up table
         self.data_table.setRowCount(len(df))
-        self.data_table.setColumnCount(len(df.columns))
-        self.data_table.setHorizontalHeaderLabels(df.columns)
+        self.data_table.setColumnCount(len(all_columns))
+        self.data_table.setHorizontalHeaderLabels(all_columns)
         
         # Fill table with data
         for i, row in df.iterrows():
-            for j, col in enumerate(df.columns):
+            # Regular columns
+            for j, col in enumerate(regular_columns):
                 item = QTableWidgetItem(str(row[col]))
                 self.data_table.setItem(i, j, item)
+            
+            # Normalized columns if available
+            if has_normalized and pd.notna(row.get('normalized')) and isinstance(row['normalized'], dict):
+                for k, norm_field in enumerate(normalized_columns):
+                    j = len(regular_columns) + k  # Column index after regular columns
+                    if norm_field in row['normalized']:
+                        norm_data = row['normalized'][norm_field]
+                        value = norm_data.get('value', '') if isinstance(norm_data, dict) else norm_data
+                        item = QTableWidgetItem(str(value))
+                        # Add tooltip showing the source field
+                        if isinstance(norm_data, dict) and 'source_field' in norm_data:
+                            item.setToolTip(f"Source field: {norm_data['source_field']}")
+                        self.data_table.setItem(i, j, item)
         
         self.data_table.resizeColumnsToContents()
     
@@ -1510,30 +1659,105 @@ class ExifToolGUI(QMainWindow):
         """Update the visualization based on the selected type"""
         viz_type = self.viz_type_combo.currentText()
         
-        # Clear the figure
-        self.figure.clear()
-        
-        if viz_type == "Camera Distribution":
-            fig = self.analyzer.plot_camera_distribution(self.figure)
-        elif viz_type == "Focal Length Distribution":
-            fig = self.analyzer.plot_focal_length_distribution(self.figure)
-        elif viz_type == "Aperture Distribution":
-            fig = self.analyzer.plot_aperture_distribution(self.figure)
-        elif viz_type == "ISO Distribution":
-            fig = self.analyzer.plot_iso_distribution(self.figure)
-        elif viz_type == "Time of Day Distribution":
-            fig = self.analyzer.plot_time_of_day(self.figure)
-        
-        if fig:
-            self.canvas.draw()
-        else:
+        # Check if data is available
+        if self.analyzer.df is None or self.analyzer.df.empty:
             # If no data for this visualization, show a message
+            self.figure.clear()
             ax = self.figure.add_subplot(111)
             ax.text(0.5, 0.5, f"No data available for {viz_type}", 
                    horizontalalignment='center', verticalalignment='center',
                    transform=ax.transAxes, fontsize=14)
             self.figure.tight_layout()
             self.canvas.draw()
+            self.viz_perf_label.setText("No data available")
+            return
+        
+        # Start a timer to measure rendering performance
+        start_time = time.time()
+        
+        # Use the enhanced visualizer with GPU acceleration if available
+        try:
+            if viz_type == "Camera Distribution":
+                fig = self.visualizer.plot_camera_distribution(self.analyzer.df, self.figure)
+            elif viz_type == "Focal Length Distribution":
+                fig = self.visualizer.plot_focal_length_distribution(self.analyzer.df, self.figure)
+            elif viz_type == "Aperture Distribution":
+                fig = self.visualizer.plot_aperture_distribution(self.analyzer.df, self.figure)
+            elif viz_type == "ISO Distribution":
+                fig = self.visualizer.plot_iso_distribution(self.analyzer.df, self.figure)
+            elif viz_type == "Time of Day Distribution":
+                fig = self.visualizer.plot_time_of_day(self.analyzer.df, self.figure)
+            elif viz_type == "Location Map":
+                fig = self.visualizer.plot_map(self.analyzer.df, self.figure)
+            elif viz_type == "Aperture vs Focal Length":
+                fig = self.visualizer.plot_heatmap(self.analyzer.df, "focal_length", "f_number", self.figure)
+            elif viz_type == "ISO vs Time of Day":
+                fig = self.visualizer.plot_heatmap(self.analyzer.df, "hour", "iso", self.figure)
+            else:
+                fig = None
+            
+            if fig:
+                # Calculate and display rendering time
+                render_time = time.time() - start_time
+                perf_msg = f"Rendered {viz_type} in {render_time:.2f} seconds"
+                if self.use_gpu:
+                    perf_msg += " (GPU accelerated)"
+                self.viz_perf_label.setText(perf_msg)
+                print(perf_msg)
+                
+                self.canvas.draw()
+            else:
+                # If no data for this visualization, show a message
+                self.figure.clear()
+                ax = self.figure.add_subplot(111)
+                ax.text(0.5, 0.5, f"No data available for {viz_type}", 
+                       horizontalalignment='center', verticalalignment='center',
+                       transform=ax.transAxes, fontsize=14)
+                self.figure.tight_layout()
+                self.canvas.draw()
+                self.viz_perf_label.setText("No data available for this visualization")
+        except Exception as e:
+            # Handle any errors during visualization
+            self.figure.clear()
+            ax = self.figure.add_subplot(111)
+            ax.text(0.5, 0.5, f"Error creating visualization: {str(e)}", 
+                   horizontalalignment='center', verticalalignment='center',
+                   transform=ax.transAxes, fontsize=12, color='red')
+            self.figure.tight_layout()
+            self.canvas.draw()
+            self.viz_perf_label.setText(f"Error: {str(e)}")
+            print(f"Visualization error: {e}")
+    
+    def toggle_gpu_visualization(self):
+        """Toggle GPU acceleration for visualizations"""
+        self.use_gpu = self.gpu_viz_checkbox.isChecked()
+        self.visualizer.use_gpu = self.use_gpu
+        self.status_label.setText(f"GPU acceleration {'enabled' if self.use_gpu else 'disabled'} for visualizations")
+        # Update the current visualization to reflect the change
+        self.update_visualization()
+    
+    def clear_visualization_cache(self):
+        """Clear the visualization cache"""
+        self.visualizer.clear_cache()
+        self.status_label.setText("Visualization cache cleared")
+        self.viz_perf_label.setText("Cache cleared")
+    
+    def export_visualization(self):
+        """Export the current visualization to a file"""
+        viz_type = self.viz_type_combo.currentText()
+        default_name = f"exif_{viz_type.lower().replace(' ', '_')}.png"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Visualization", default_name, "PNG Files (*.png);;PDF Files (*.pdf);;SVG Files (*.svg)")
+        
+        if file_path:
+            try:
+                # Save the current figure to the specified file
+                self.figure.savefig(file_path, dpi=300, bbox_inches='tight')
+                self.status_label.setText(f"Visualization exported to {file_path}")
+                QMessageBox.information(self, "Success", f"Visualization exported to {file_path}")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to export visualization: {str(e)}")
+
 
 
 def main():

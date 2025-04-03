@@ -37,6 +37,8 @@ def parse_args():
     parser.add_argument('--export-collection', type=int, help='Export a specific collection ID to CSV')
     parser.add_argument('--list-collections', action='store_true', help='List all collections in the database')
     parser.add_argument('--stats', action='store_true', help='Show database statistics')
+    parser.add_argument('--list-normalized-fields', action='store_true', help='List all available normalized EXIF fields')
+    parser.add_argument('--list-normalized-values', help='List all values for a specific normalized field')
     
     # Visualization options
     parser.add_argument('--visualize', '-v', action='store_true', help='Generate visualization charts')
@@ -68,6 +70,14 @@ def main():
                 
             if args.stats:
                 show_stats(db)
+                return 0
+                
+            if args.list_normalized_fields:
+                list_normalized_fields(db)
+                return 0
+                
+            if args.list_normalized_values:
+                list_normalized_values(db, args.list_normalized_values)
                 return 0
                 
             if args.export_collection is not None:
@@ -261,9 +271,9 @@ def export_collection(db, collection_id, output_dir):
         
         # Export to CSV
         csv_path = os.path.join(output_dir, f"collection_{collection_id}_{collection_name}.csv")
-        db.export_to_csv(csv_path, collection_id)
+        db.export_to_csv(csv_path, collection_id, include_normalized=True)
         
-        print(f"Exported to {csv_path}")
+        print(f"Exported to {csv_path} (including normalized EXIF fields)")
     except Exception as e:
         print(f"Error exporting collection: {e}")
 
@@ -298,9 +308,15 @@ def search_database(db, query, output_dir):
             search_params['date_to'] = value
         elif field == 'tag_name':
             search_params['tag_name'] = value
+        elif field.startswith('norm_'):
+            # Handle normalized field search
+            normalized_field = field[5:]  # Remove 'norm_' prefix
+            search_params['normalized_field'] = normalized_field
+            search_params['normalized_value'] = value
         else:
             print(f"Error: Unsupported search field '{field}'")
             print("Supported fields: camera_make, camera_model, lens_model, file_type, date_from, date_to, tag_name")
+            print("For normalized fields, use prefix 'norm_' (e.g., 'norm_FirmwareVersion=1.2.3')")
             return
         
         # Perform search
@@ -327,6 +343,41 @@ def search_database(db, query, output_dir):
         print(f"Exported results to {csv_path}")
     except Exception as e:
         print(f"Error searching database: {e}")
+
+
+def list_normalized_fields(db):
+    """List all available normalized EXIF fields"""
+    try:
+        fields = db.get_available_normalized_fields()
+        
+        if not fields:
+            print("No normalized EXIF fields found in the database")
+            return
+        
+        print("\nAvailable normalized EXIF fields:")
+        for field in fields:
+            print(f"  {field}")
+        print("\nTo search using normalized fields, use the prefix 'norm_' with --query")
+        print("Example: --query 'norm_FirmwareVersion=1.2.3'")
+        print("\nTo list values for a specific field, use --list-normalized-values FIELD_NAME")
+    except Exception as e:
+        print(f"Error listing normalized fields: {e}")
+
+
+def list_normalized_values(db, field_name):
+    """List all values for a specific normalized field"""
+    try:
+        values = db.get_normalized_field_values(field_name)
+        
+        if not values:
+            print(f"No values found for normalized field '{field_name}'")
+            return
+        
+        print(f"\nValues for normalized field '{field_name}':")
+        for value in values:
+            print(f"  {value}")
+    except Exception as e:
+        print(f"Error listing normalized field values: {e}")
 
 
 if __name__ == "__main__":
