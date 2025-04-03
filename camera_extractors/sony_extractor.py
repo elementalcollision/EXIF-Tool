@@ -215,61 +215,73 @@ class SonyExtractor(CameraExtractor):
             def extract_raw_stats(raw):
                 stats_result = {}
                 try:
-                    with safe_array_operation():
-                        # Get raw image data - use sampling to reduce memory usage
-                        raw_image = raw.raw_image
-                        
-                        # For large images, sample to reduce memory usage
-                        if raw_image.size > 20_000_000:  # For very large sensors
-                            sample_rate = max(1, int(np.sqrt(raw_image.size / 1_000_000)))
-                            sampled_image = raw_image[::sample_rate, ::sample_rate]
-                            logger.info(f"Sampling raw image at 1/{sample_rate} for stats calculation")
+                    # Get raw image data - use sampling to reduce memory usage
+                    raw_image = raw.raw_image
+                    
+                    # Ensure we're working with a numpy array
+                    if not isinstance(raw_image, np.ndarray):
+                        logger.warning(f"Raw image is not a numpy array, converting from {type(raw_image).__name__}")
+                        # Try to convert to numpy array if it's a list
+                        if isinstance(raw_image, list):
+                            raw_image = np.array(raw_image)
                         else:
-                            sampled_image = raw_image
-                        
-                        # Get basic stats about the raw image
-                        raw_min = np.min(sampled_image)
-                        raw_max = np.max(sampled_image)
-                        
-                        # Record shape and min/max
-                        stats_result['sony_raw_image_shape'] = str(raw_image.shape)
-                        stats_result['sony_raw_min_value'] = int(raw_min)
-                        stats_result['sony_raw_max_value'] = int(raw_max)
-                        
-                        # Calculate histogram with reduced bins for efficiency
-                        histogram, _ = np.histogram(sampled_image.flatten(), bins=256)
-                        
-                        # Calculate basic statistics
-                        stats_result['sony_raw_histogram_mean'] = float(np.mean(histogram))
-                        stats_result['sony_raw_histogram_std'] = float(np.std(histogram))
-                        stats_result['sony_raw_dynamic_range'] = float(np.log2(raw_max - raw_min + 1)) if raw_max > raw_min else 0
-                        
-                        # If GPU is available, do more advanced processing
-                        if self.use_gpu:
-                            try:
-                                import torch
-                                if torch.backends.mps.is_available():
-                                    # Convert to tensor and move to GPU
-                                    device = torch.device("mps")
-                                    tensor = torch.tensor(sampled_image, device=device)
-                                    
-                                    # Calculate percentiles for exposure analysis
-                                    percentiles = [1, 5, 10, 50, 90, 95, 99]
-                                    for p in percentiles:
-                                        stats_result[f'sony_raw_percentile_{p}'] = float(torch.quantile(tensor.float(), p/100).cpu().numpy())
-                                    
-                                    # Calculate exposure metrics
-                                    highlight_threshold = 0.95 * raw_max
-                                    shadow_threshold = raw_min + 0.05 * (raw_max - raw_min)
-                                    
-                                    highlight_percentage = (tensor > highlight_threshold).sum().item() / tensor.numel() * 100
-                                    shadow_percentage = (tensor < shadow_threshold).sum().item() / tensor.numel() * 100
-                                    
-                                    stats_result['sony_highlight_percentage'] = round(highlight_percentage, 2)
-                                    stats_result['sony_shadow_percentage'] = round(shadow_percentage, 2)
-                                    stats_result['sony_midtone_percentage'] = round(100 - highlight_percentage - shadow_percentage, 2)
-                            except Exception as e:
-                                logger.error(f"GPU processing error: {e}")
+                            # If we can't convert, just return basic info
+                            stats_result['sony_raw_image_type'] = str(type(raw_image).__name__)
+                            stats_result['sony_raw_conversion_error'] = "Unable to convert to numpy array"
+                            return stats_result
+                    
+                    # For large images, sample to reduce memory usage
+                    if raw_image.size > 20_000_000:  # For very large sensors
+                        sample_rate = max(1, int(np.sqrt(raw_image.size / 1_000_000)))
+                        sampled_image = raw_image[::sample_rate, ::sample_rate]
+                        logger.info(f"Sampling raw image at 1/{sample_rate} for stats calculation")
+                    else:
+                        sampled_image = raw_image
+                    
+                    # Get basic stats about the raw image
+                    raw_min = np.min(sampled_image)
+                    raw_max = np.max(sampled_image)
+                    
+                    # Record shape and min/max
+                    stats_result['sony_raw_image_shape'] = str(raw_image.shape)
+                    stats_result['sony_raw_min_value'] = int(raw_min)
+                    stats_result['sony_raw_max_value'] = int(raw_max)
+                    
+                    # Calculate histogram with reduced bins for efficiency
+                    histogram, _ = np.histogram(sampled_image.flatten(), bins=256)
+                    
+                    # Calculate basic statistics
+                    stats_result['sony_raw_histogram_mean'] = float(np.mean(histogram))
+                    stats_result['sony_raw_histogram_std'] = float(np.std(histogram))
+                    stats_result['sony_raw_dynamic_range'] = float(np.log2(raw_max - raw_min + 1)) if raw_max > raw_min else 0
+                    
+                    # If GPU is available, do more advanced processing
+                    if self.use_gpu:
+                        try:
+                            import torch
+                            if torch.backends.mps.is_available():
+                                # Convert to tensor and move to GPU
+                                device = torch.device("mps")
+                                # Ensure we're passing a numpy array to torch.tensor
+                                tensor = torch.tensor(np.asarray(sampled_image), device=device)
+                                
+                                # Calculate percentiles for exposure analysis
+                                percentiles = [1, 5, 10, 50, 90, 95, 99]
+                                for p in percentiles:
+                                    stats_result[f'sony_raw_percentile_{p}'] = float(torch.quantile(tensor.float(), p/100).cpu().numpy())
+                                
+                                # Calculate exposure metrics
+                                highlight_threshold = 0.95 * raw_max
+                                shadow_threshold = raw_min + 0.05 * (raw_max - raw_min)
+                                
+                                highlight_percentage = (tensor > highlight_threshold).sum().item() / tensor.numel() * 100
+                                shadow_percentage = (tensor < shadow_threshold).sum().item() / tensor.numel() * 100
+                                
+                                stats_result['sony_highlight_percentage'] = round(highlight_percentage, 2)
+                                stats_result['sony_shadow_percentage'] = round(shadow_percentage, 2)
+                                stats_result['sony_midtone_percentage'] = round(100 - highlight_percentage - shadow_percentage, 2)
+                        except Exception as e:
+                            logger.error(f"GPU processing error: {e}")
                 except Exception as e:
                     logger.error(f"Error extracting raw stats: {e}")
                 return stats_result
@@ -293,38 +305,100 @@ class SonyExtractor(CameraExtractor):
                     logger.error(f"Thumbnail extraction error: {e}")
                 return thumb_result
             
+            # Add basic file info to result regardless of processing success
+            result['file_path'] = image_path
+            result['file_size'] = os.path.getsize(image_path) if os.path.exists(image_path) else 0
+            result['sony_model'] = exif_data.get('camera_model', 'Unknown')
+            
+            # First try to use exiftool as a safer alternative
             try:
-                # Open the raw file once and process in parallel
-                with rawpy.imread(image_path) as raw:
-                    logger.info(f"Processing Sony ARW file: {image_path}")
+                import subprocess
+                # Check if exiftool is available
+                try:
+                    exiftool_version = subprocess.run(['exiftool', '-ver'], 
+                                                    capture_output=True, 
+                                                    check=True, 
+                                                    text=True).stdout.strip()
                     
-                    # Use thread pool for parallel processing
-                    with self.thread_pool.get_pool() as executor:
-                        # Submit tasks
-                        basic_future = executor.submit(extract_basic_metadata, raw)
-                        stats_future = executor.submit(extract_raw_stats, raw)
-                        thumb_future = executor.submit(extract_thumbnail, raw)
+                    # If exiftool is available, use it to extract basic metadata
+                    exiftool_cmd = ['exiftool', '-json', '-g', image_path]
+                    exiftool_output = subprocess.run(exiftool_cmd, 
+                                                    capture_output=True, 
+                                                    check=True, 
+                                                    text=True).stdout
+                    
+                    import json
+                    try:
+                        exiftool_data = json.loads(exiftool_output)[0]
+                        # Add basic exiftool data to result
+                        result['exiftool_used'] = True
                         
-                        # Collect results
-                        try:
-                            basic_result = basic_future.result()
+                        # Extract key metadata from exiftool output
+                        if 'File' in exiftool_data:
+                            file_info = {f"file_{k.lower().replace(' ', '_')}": v 
+                                        for k, v in exiftool_data['File'].items()}
+                            result.update(file_info)
+                            
+                        if 'Sony' in exiftool_data:
+                            sony_info = {f"sony_{k.lower().replace(' ', '_')}": v 
+                                        for k, v in exiftool_data['Sony'].items()}
+                            result.update(sony_info)
+                    except json.JSONDecodeError:
+                        logger.warning("Failed to parse exiftool JSON output")
+                except (subprocess.SubprocessError, FileNotFoundError):
+                    logger.warning("Exiftool not available")
+            except Exception as e:
+                logger.warning(f"Error using exiftool: {e}")
+            
+            # Now try to use rawpy with robust error handling
+            try:
+                # Try to open the raw file with a timeout to prevent hanging
+                import signal
+                
+                # Define a timeout handler
+                def timeout_handler(signum, frame):
+                    raise TimeoutError("Timed out opening RAW file")
+                
+                # Set a timeout of 5 seconds for opening the file
+                original_handler = signal.getsignal(signal.SIGALRM)
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(5)
+                
+                try:
+                    with rawpy.imread(image_path) as raw:
+                        # Cancel the alarm once file is opened
+                        signal.alarm(0)
+                        logger.info(f"Processing Sony ARW file: {image_path}")
+                        
+                        # Process the raw file in a safer way - one task at a time
+                        # First extract basic metadata
+                        basic_result = extract_basic_metadata(raw)
+                        if basic_result:
                             result.update(basic_result)
-                        except Exception as e:
-                            logger.error(f"Error getting basic metadata results: {e}")
                         
-                        try:
-                            stats_result = stats_future.result()
-                            result.update(stats_result)
-                        except Exception as e:
-                            logger.error(f"Error getting raw stats results: {e}")
-                        
-                        try:
-                            thumb_result = thumb_future.result()
+                        # Then try to extract thumbnail
+                        thumb_result = extract_thumbnail(raw)
+                        if thumb_result:
                             result.update(thumb_result)
-                        except Exception as e:
-                            logger.error(f"Error getting thumbnail results: {e}")
+                        
+                        # Finally try to extract raw stats if previous steps succeeded
+                        if not any(k.endswith('_error') for k in basic_result.keys()):
+                            stats_result = extract_raw_stats(raw)
+                            if stats_result:
+                                result.update(stats_result)
+                except TimeoutError as e:
+                    logger.error(f"Timeout opening RAW file: {e}")
+                    result['rawpy_timeout_error'] = str(e)
+                finally:
+                    # Reset the alarm handler
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, original_handler)
+            except (rawpy.LibRawError, IOError, ValueError) as e:
+                logger.error(f"Error opening RAW file with rawpy: {e}")
+                result['rawpy_error'] = str(e)
             except Exception as e:
                 logger.error(f"Sony ARW processing error: {e}")
+                result['processing_error'] = str(e)
             
             # Log performance metrics
             end_time = time.time()

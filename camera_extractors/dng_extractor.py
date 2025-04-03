@@ -113,99 +113,183 @@ class DngExtractor(CameraExtractor):
         Returns:
             Dictionary containing processed DNG data
         """
-        result = {}
+        # Initialize result with basic file info regardless of processing success
+        result = {
+            'file_path': image_path,
+            'file_size': os.path.getsize(image_path) if os.path.exists(image_path) else 0,
+            'dng_model': exif_data.get('camera_model', 'Unknown'),
+            'dng_make': exif_data.get('camera_make', 'Unknown')
+        }
         
+        # First try to use exiftool as a safer alternative
         try:
-            print(f"Processing DNG specific data")
-            with rawpy.imread(image_path) as raw:
-                # Get raw image data
-                raw_image = raw.raw_image.copy()
-                
-                # Get basic stats about the raw image
-                raw_min = np.min(raw_image)
-                raw_max = np.max(raw_image)
-                print(f"Raw image shape: {raw_image.shape}")
-                print(f"Raw image min/max values: {raw_min}/{raw_max}")
-                
-                # Calculate histogram
-                histogram, _ = np.histogram(raw_image.flatten(), bins=256)
-                
-                # DNG specific fields
-                dng_metadata = {
-                    'dng_raw_image_shape': str(raw_image.shape),
-                    'dng_raw_min_value': int(raw_min),
-                    'dng_raw_max_value': int(raw_max),
-                    'dng_raw_histogram_mean': float(np.mean(histogram)),
-                    'dng_raw_histogram_std': float(np.std(histogram)),
-                    'dng_raw_dynamic_range': float(np.log2(raw_max - raw_min + 1)) if raw_max > raw_min else 0,
-                    'dng_raw_black_level': int(raw.black_level) if hasattr(raw, 'black_level') else 0,
-                    'dng_raw_white_level': int(raw.white_level) if hasattr(raw, 'white_level') else 0
-                }
-                
-                # Add DNG metadata to result
-                result.update(dng_metadata)
-                
-                # Try to extract thumbnail
-                try:
-                    thumb = raw.extract_thumb()
-                    if thumb and hasattr(thumb, 'format'):
-                        result['has_thumbnail'] = True
-                        result['thumbnail_format'] = thumb.format
-                        print(f"Extracted thumbnail in {thumb.format} format")
-                        
-                        # Process thumbnail if needed
-                        if thumb.format == 'jpeg':
-                            thumbnail_data = self.process_thumbnail(thumb.data, thumb.format)
-                            if thumbnail_data:
-                                result.update(thumbnail_data)
-                except Exception as thumb_error:
-                    result['has_thumbnail'] = False
-                    print(f"Thumbnail extraction error: {thumb_error}")
-                
-                # Try to get color profile information
-                if hasattr(raw, 'color_desc'):
-                    result['dng_color_profile'] = raw.color_desc.decode('utf-8', errors='ignore')
-                    print(f"Color profile: {result['dng_color_profile']}")
-                
-                # Get white balance coefficients if available
-                if hasattr(raw, 'camera_whitebalance'):
-                    # Handle different types of camera_whitebalance
-                    if hasattr(raw.camera_whitebalance, 'tolist'):
-                        result['dng_camera_whitebalance'] = raw.camera_whitebalance.tolist()
-                    else:
-                        result['dng_camera_whitebalance'] = str(raw.camera_whitebalance)
-                    print(f"Camera white balance: {result['dng_camera_whitebalance']}")
-                
-                # Get full resolution dimensions
-                if hasattr(raw, 'sizes'):
-                    result['dng_full_width'] = raw.sizes.width
-                    result['dng_full_height'] = raw.sizes.height
-                    print(f"Full resolution: {result['dng_full_width']}x{result['dng_full_height']}")
-                
-                # Add Leica-specific processing if needed
-                if self.is_leica:
-                    # Leica cameras often have specific color profiles
-                    result['leica_processed'] = True
+            if self._check_exiftool():
+                print("Using exiftool for DNG metadata extraction")
+                exiftool_data = self._run_exiftool(image_path)
+                if exiftool_data:
+                    # Extract key metadata from exiftool output
+                    for key, value in exiftool_data.items():
+                        if key.startswith('DNG'):
+                            # Convert to snake_case
+                            dng_key = 'dng_' + key[3:].lower().replace(' ', '_')
+                            result[dng_key] = value
                     
-                    # Use GPU acceleration for Leica files if available
-                    if self.use_gpu:
-                        try:
-                            import torch
-                            if torch.backends.mps.is_available():
-                                print("Processing Leica DNG with Metal GPU acceleration")
-                                # Convert raw data to tensor for processing
-                                raw_tensor = torch.from_numpy(raw_image).to('mps')
-                                
-                                # Calculate basic statistics with GPU
-                                result['leica_raw_mean'] = float(torch.mean(raw_tensor).item())
-                                result['leica_raw_std'] = float(torch.std(raw_tensor).item())
-                                
-                                print("Leica GPU processing completed")
-                        except Exception as gpu_error:
-                            print(f"GPU processing error: {gpu_error}")
+                    # Extract Leica-specific data if applicable
+                    if self.is_leica:
+                        for key, value in exiftool_data.items():
+                            if key.startswith('Leica'):
+                                # Convert to snake_case
+                                leica_key = 'leica_' + key[5:].lower().replace(' ', '_')
+                                result[leica_key] = value
+                    
+                    # Add raw processing status
+                    result['raw_processing_status'] = 'exiftool_primary'
+        except Exception as e:
+            print(f"Error using exiftool: {e}")
+            result['exiftool_error'] = str(e)
         
-        except Exception as dng_error:
-            print(f"DNG specific error: {dng_error}")
+        # Process DNG file with rawpy with robust error handling
+        try:
+            # Try to open the raw file with a timeout to prevent hanging
+            import signal
+            
+            # Define a timeout handler
+            def timeout_handler(signum, frame):
+                raise TimeoutError("Timed out opening DNG file")
+            
+            # Set a timeout of 5 seconds for opening the file
+            original_handler = signal.getsignal(signal.SIGALRM)
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(5)
+            
+            try:
+                with rawpy.imread(image_path) as raw:
+                    # Cancel the alarm once file is opened
+                    signal.alarm(0)
+                    print(f"Processing DNG file: {image_path}")
+                    
+                    try:
+                        # Get raw image data - use sampling to reduce memory usage
+                        raw_image = raw.raw_image.copy()
+                        
+                        # For large images, sample to reduce memory usage
+                        if raw_image.size > 20_000_000:  # For very large sensors
+                            sample_rate = max(1, int(np.sqrt(raw_image.size / 1_000_000)))
+                            sampled_image = raw_image[::sample_rate, ::sample_rate]
+                            print(f"Sampling raw image at 1/{sample_rate} for stats calculation")
+                        else:
+                            sampled_image = raw_image
+                        
+                        # Get basic stats about the raw image
+                        raw_min = np.min(sampled_image)
+                        raw_max = np.max(sampled_image)
+                        print(f"Raw image shape: {raw_image.shape}")
+                        print(f"Raw image min/max values: {raw_min}/{raw_max}")
+                        
+                        # Calculate histogram with reduced bins for efficiency
+                        histogram, _ = np.histogram(sampled_image.flatten(), bins=256)
+                        
+                        # DNG specific fields
+                        dng_metadata = {
+                            'dng_raw_image_shape': str(raw_image.shape),
+                            'dng_raw_min_value': int(raw_min),
+                            'dng_raw_max_value': int(raw_max),
+                            'dng_raw_histogram_mean': float(np.mean(histogram)),
+                            'dng_raw_histogram_std': float(np.std(histogram)),
+                            'dng_raw_dynamic_range': float(np.log2(raw_max - raw_min + 1)) if raw_max > raw_min else 0,
+                            'dng_raw_black_level': int(raw.black_level) if hasattr(raw, 'black_level') else 0,
+                            'dng_raw_white_level': int(raw.white_level) if hasattr(raw, 'white_level') else 0
+                        }
+                        
+                        # Add DNG metadata to result
+                        result.update(dng_metadata)
+                        result['raw_processing_status'] = 'rawpy_success'
+                    except Exception as stats_error:
+                        print(f"Error processing raw image stats: {stats_error}")
+                        result['stats_error'] = str(stats_error)
+                    
+                    # Try to extract thumbnail - separate try block to ensure it runs even if stats fail
+                    try:
+                        thumb = raw.extract_thumb()
+                        if thumb and hasattr(thumb, 'format'):
+                            result['has_thumbnail'] = True
+                            result['thumbnail_format'] = thumb.format
+                            print(f"Extracted thumbnail in {thumb.format} format")
+                            
+                            # Process thumbnail if needed
+                            if thumb.format == 'jpeg':
+                                thumbnail_data = self.process_thumbnail(thumb.data, thumb.format)
+                                if thumbnail_data:
+                                    result.update(thumbnail_data)
+                    except Exception as thumb_error:
+                        result['has_thumbnail'] = False
+                        print(f"Thumbnail extraction error: {thumb_error}")
+                        result['thumbnail_error'] = str(thumb_error)
+                    
+                    # Try to get color profile information - separate try block
+                    try:
+                        if hasattr(raw, 'color_desc'):
+                            result['dng_color_profile'] = raw.color_desc.decode('utf-8', errors='ignore')
+                            print(f"Color profile: {result['dng_color_profile']}")
+                        
+                        # Get white balance coefficients if available
+                        if hasattr(raw, 'camera_whitebalance'):
+                            # Handle different types of camera_whitebalance
+                            if isinstance(raw.camera_whitebalance, np.ndarray) and hasattr(raw.camera_whitebalance, 'tolist'):
+                                result['dng_camera_whitebalance'] = raw.camera_whitebalance.tolist()
+                            else:
+                                result['dng_camera_whitebalance'] = str(raw.camera_whitebalance)
+                            print(f"Camera white balance: {result['dng_camera_whitebalance']}")
+                        
+                        # Get full resolution dimensions
+                        if hasattr(raw, 'sizes'):
+                            result['dng_full_width'] = raw.sizes.width
+                            result['dng_full_height'] = raw.sizes.height
+                            print(f"Full resolution: {result['dng_full_width']}x{result['dng_full_height']}")
+                    except Exception as metadata_error:
+                        print(f"Error extracting metadata: {metadata_error}")
+                        result['metadata_error'] = str(metadata_error)
+                    
+                    # Add Leica-specific processing if needed
+                    if self.is_leica and not any(k.endswith('_error') for k in result.keys()):
+                        # Leica cameras often have specific color profiles
+                        result['leica_processed'] = True
+                        
+                        # Use GPU acceleration for Leica files if available
+                        if self.use_gpu:
+                            try:
+                                import torch
+                                if torch.backends.mps.is_available():
+                                    print("Processing Leica DNG with Metal GPU acceleration")
+                                    # Convert raw data to tensor for processing
+                                    raw_tensor = torch.from_numpy(sampled_image).to('mps')
+                                    
+                                    # Calculate basic statistics with GPU
+                                    result['leica_raw_mean'] = float(torch.mean(raw_tensor).item())
+                                    result['leica_raw_std'] = float(torch.std(raw_tensor).item())
+                                    
+                                    print("Leica GPU processing completed")
+                            except Exception as gpu_error:
+                                print(f"GPU processing error: {gpu_error}")
+                                result['gpu_error'] = str(gpu_error)
+            except TimeoutError as e:
+                print(f"Timeout opening DNG file: {e}")
+                result['rawpy_timeout_error'] = str(e)
+                result['raw_processing_status'] = 'timeout'
+            except (rawpy.LibRawError, ValueError, IOError) as e:
+                print(f"Error opening DNG file with rawpy: {e}")
+                result['rawpy_error'] = str(e)
+                result['raw_processing_status'] = 'failed'
+            finally:
+                # Reset the alarm handler
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, original_handler)
+        except ImportError:
+            print("rawpy not available for DNG processing")
+            result['rawpy_import_error'] = "rawpy module not available"
+        except Exception as e:
+            print(f"DNG processing error: {e}")
+            result['processing_error'] = str(e)
         
         return result
     

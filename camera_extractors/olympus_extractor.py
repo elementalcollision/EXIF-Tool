@@ -438,50 +438,129 @@ class OlympusExtractor(CameraExtractor):
                     logger.error(f"Thumbnail extraction error: {e}")
                 return thumb_result
             
-            # Process ORF file with rawpy
+            # Add basic file info to result regardless of processing success
+            result['file_path'] = image_path
+            result['file_size'] = os.path.getsize(image_path) if os.path.exists(image_path) else 0
+            result['olympus_model'] = exif_data.get('camera_model', 'Unknown')
+            
+            # First try to use exiftool as a safer alternative
+            try:
+                import subprocess
+                # Check if exiftool is available
+                try:
+                    exiftool_version = subprocess.run(['exiftool', '-ver'], 
+                                                    capture_output=True, 
+                                                    check=True, 
+                                                    text=True).stdout.strip()
+                    
+                    # If exiftool is available, use it to extract basic metadata
+                    exiftool_cmd = ['exiftool', '-json', '-g', image_path]
+                    exiftool_output = subprocess.run(exiftool_cmd, 
+                                                    capture_output=True, 
+                                                    check=True, 
+                                                    text=True).stdout
+                    
+                    import json
+                    try:
+                        exiftool_data = json.loads(exiftool_output)[0]
+                        # Add basic exiftool data to result
+                        result['exiftool_used'] = True
+                        
+                        # Extract key metadata from exiftool output
+                        if 'File' in exiftool_data:
+                            file_info = {f"file_{k.lower().replace(' ', '_')}": v 
+                                        for k, v in exiftool_data['File'].items()}
+                            result.update(file_info)
+                            
+                        if 'Olympus' in exiftool_data:
+                            olympus_info = {f"olympus_{k.lower().replace(' ', '_')}": v 
+                                        for k, v in exiftool_data['Olympus'].items()}
+                            result.update(olympus_info)
+                            
+                        # Extract image dimensions if available
+                        if 'ImageWidth' in exiftool_data and 'ImageHeight' in exiftool_data:
+                            result['olympus_image_width'] = exiftool_data['ImageWidth']
+                            result['olympus_image_height'] = exiftool_data['ImageHeight']
+                            result['olympus_megapixels'] = round(exiftool_data['ImageWidth'] * exiftool_data['ImageHeight'] / 1000000, 1)
+                        
+                        # Extract color space information
+                        if 'ColorSpace' in exiftool_data:
+                            result['olympus_color_space'] = exiftool_data['ColorSpace']
+                        
+                        # Extract bit depth if available
+                        if 'BitsPerSample' in exiftool_data:
+                            result['olympus_bits_per_sample'] = exiftool_data['BitsPerSample']
+                        
+                        # Extract compression information
+                        if 'Compression' in exiftool_data:
+                            result['olympus_compression'] = exiftool_data['Compression']
+                        
+                        # Get ORF version if available
+                        if 'ORFVersion' in exiftool_data:
+                            result['olympus_orf_version'] = exiftool_data['ORFVersion']
+                        elif 'RAWVersion' in exiftool_data:
+                            result['olympus_raw_version'] = exiftool_data['RAWVersion']
+                            
+                        # Add raw processing status
+                        result['raw_processing_status'] = 'exiftool_primary'
+                    except json.JSONDecodeError:
+                        logger.warning("Failed to parse exiftool JSON output")
+                except (subprocess.SubprocessError, FileNotFoundError):
+                    logger.warning("Exiftool not available")
+            except Exception as e:
+                logger.warning(f"Error using exiftool: {e}")
+            
+            # Process ORF file with rawpy with robust error handling
             try:
                 import rawpy
-                # Handle potential file format issues
+                # Try to open the raw file with a timeout to prevent hanging
+                import signal
+                
+                # Define a timeout handler
+                def timeout_handler(signum, frame):
+                    raise TimeoutError("Timed out opening RAW file")
+                
+                # Set a timeout of 5 seconds for opening the file
+                original_handler = signal.getsignal(signal.SIGALRM)
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(5)
+                
                 try:
                     with rawpy.imread(image_path) as raw:
+                        # Cancel the alarm once file is opened
+                        signal.alarm(0)
                         logger.info(f"Processing Olympus ORF file: {image_path}")
                         
-                        # Use thread pool for parallel processing
-                        with self.thread_pool.get_pool() as executor:
-                            # Submit tasks
-                            basic_future = executor.submit(extract_basic_metadata, raw)
-                            stats_future = executor.submit(extract_raw_stats, raw)
-                            thumb_future = executor.submit(extract_thumbnail, raw)
-                        
-                        # Collect results
-                        try:
-                            basic_result = basic_future.result()
+                        # Process the raw file in a safer way - one task at a time
+                        # First extract basic metadata
+                        basic_result = extract_basic_metadata(raw)
+                        if basic_result:
                             result.update(basic_result)
-                        except Exception as e:
-                            logger.error(f"Error getting basic metadata results: {e}")
+                            result['raw_processing_status'] = 'rawpy_success'
                         
-                        try:
-                            stats_result = stats_future.result()
-                            result.update(stats_result)
-                        except Exception as e:
-                            logger.error(f"Error getting raw stats results: {e}")
-                        
-                        try:
-                            thumb_result = thumb_future.result()
+                        # Then try to extract thumbnail
+                        thumb_result = extract_thumbnail(raw)
+                        if thumb_result:
                             result.update(thumb_result)
-                        except Exception as e:
-                            logger.error(f"Error getting thumbnail results: {e}")
-                except Exception as raw_error:
-                    logger.error(f"Error opening ORF file with rawpy: {raw_error}")
-                    # Add basic file information even if raw processing fails
-                    result['olympus_raw_processing_error'] = str(raw_error)
-                    result['olympus_file_processed'] = True
+                        
+                        # Finally try to extract raw stats if previous steps succeeded
+                        if not any(k.endswith('_error') for k in result.keys()):
+                            stats_result = extract_raw_stats(raw)
+                            if stats_result:
+                                result.update(stats_result)
+                except TimeoutError as e:
+                    logger.error(f"Timeout opening RAW file: {e}")
+                    result['rawpy_timeout_error'] = str(e)
+                    result['raw_processing_status'] = 'timeout'
+                except (rawpy.LibRawError, ValueError, IOError) as e:
+                    logger.error(f"Error opening ORF file with rawpy: {e}")
+                    result['rawpy_error'] = str(e)
+                    result['raw_processing_status'] = 'failed'
                     
-                    # Try to extract basic information using exiftool instead
-                    logger.info("Falling back to exiftool for basic ORF information")
-                    if self._check_exiftool():
-                        exiftool_data = self._run_exiftool(image_path)
-                        if exiftool_data:
+                    # Try to extract preview image using exiftool as fallback
+                    logger.info("Falling back to exiftool for preview extraction")
+                    preview_path = self._extract_preview(image_path)
+                    if preview_path:
                             # Extract image dimensions if available
                             if 'ImageWidth' in exiftool_data and 'ImageHeight' in exiftool_data:
                                 result['olympus_image_width'] = exiftool_data['ImageWidth']

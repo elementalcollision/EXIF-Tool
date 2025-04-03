@@ -245,13 +245,32 @@ def set_memory_limit(memory_limit_fraction: float = 0.75):
     total_memory = psutil.virtual_memory().total
     memory_limit = int(total_memory * memory_limit_fraction)
     
+    # Get current resource limits
+    current_soft, current_hard = resource.getrlimit(resource.RLIMIT_AS)
+    
+    # Check if we're trying to increase beyond the hard limit
+    if memory_limit > current_hard and current_hard != resource.RLIM_INFINITY:
+        # Can't set limit higher than current hard limit
+        logger.info(f"Using existing memory limit: {current_hard / (1024**3):.2f} GB")
+        return current_hard
+    
     # Set memory limit (soft and hard)
     try:
+        # Try to set both soft and hard limits
         resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
         logger.info(f"Memory limit set to {memory_limit / (1024**3):.2f} GB "
                    f"({memory_limit_fraction*100:.0f}% of total)")
     except (ValueError, resource.error) as e:
-        logger.warning(f"Failed to set memory limit: {e}")
+        try:
+            # If that fails, try to set just the soft limit
+            resource.setrlimit(resource.RLIMIT_AS, (memory_limit, current_hard))
+            logger.info(f"Soft memory limit set to {memory_limit / (1024**3):.2f} GB")
+        except (ValueError, resource.error):
+            # If we can't set limits at all, just log it
+            logger.info(f"Using soft memory monitoring with target: {memory_limit / (1024**3):.2f} GB")
+            # We'll rely on the MemoryTracker class to monitor usage
+    
+    return memory_limit
 
 
 def performance_monitor(func):
@@ -288,15 +307,61 @@ def performance_monitor(func):
     return wrapper
 
 
-def safe_array_operation(func):
-    """Decorator to make array operations memory-safe
+class SafeArrayOperationContext:
+    """Context manager for safe array operations
+    
+    This class provides a context manager interface for safe array operations,
+    which can be used with the 'with' statement.
+    
+    Example:
+        with SafeArrayOperationContext():
+            # Code that might cause memory issues
+            result = process_large_array(data)
+    """
+    
+    def __init__(self):
+        self.original_memory = None
+    
+    def __enter__(self):
+        # Record memory usage on entry
+        self.original_memory = psutil.Process(os.getpid()).memory_info().rss
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # If we had a memory error, try to recover
+        if exc_type is MemoryError:
+            # Force garbage collection
+            gc.collect()
+            logger.warning(f"Memory error in context, recovered with GC")
+            return True  # Suppress the exception
+        
+        # Check if memory usage increased significantly
+        current_memory = psutil.Process(os.getpid()).memory_info().rss
+        if current_memory > self.original_memory * 2:  # More than doubled
+            logger.warning(f"High memory usage detected: {(current_memory - self.original_memory) / (1024*1024):.2f} MB increase")
+            gc.collect()  # Force garbage collection
+        
+        return False  # Don't suppress other exceptions
+
+
+def safe_array_operation(func=None):
+    """Make array operations memory-safe
+    
+    This function can be used in two ways:
+    1. As a decorator: @safe_array_operation
+    2. As a context manager: with safe_array_operation():
     
     Args:
-        func: Function to make memory-safe
+        func: Function to make memory-safe (when used as decorator)
     
     Returns:
-        Wrapped function with memory safety
+        Wrapped function with memory safety or context manager
     """
+    # If used as context manager (with safe_array_operation():)
+    if func is None:
+        return SafeArrayOperationContext()
+    
+    # If used as decorator (@safe_array_operation)
     @wraps(func)
     def wrapper(*args, **kwargs):
         try:

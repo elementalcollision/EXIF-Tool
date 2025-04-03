@@ -108,11 +108,16 @@ class PanasonicExtractor(CameraExtractor):
         Returns:
             True if this extractor can handle the file, False otherwise
         """
-        # Check if it's a Panasonic camera
-        is_panasonic = exif_data.get('camera_make', '').upper() == 'PANASONIC'
-        
         # Check if it's an RW2 file
         is_rw2 = file_ext.lower() == '.rw2'
+        
+        # If it's an RW2 file, assume it's Panasonic and set the camera make
+        if is_rw2 and not exif_data.get('camera_make'):
+            exif_data['camera_make'] = 'Panasonic'
+            is_panasonic = True
+        else:
+            # Check if it's a Panasonic camera
+            is_panasonic = any(x in exif_data.get('camera_make', '').upper() for x in ['PANASONIC', 'LUMIX'])
         
         return is_panasonic and is_rw2
     
@@ -307,6 +312,54 @@ class PanasonicExtractor(CameraExtractor):
             start_time = time.time()
             result = {}
             
+            # Always try to extract camera make and model information first using exiftool
+            try:
+                import subprocess
+                import json
+                
+                logger.info(f"Using exiftool to extract camera make and model information")
+                exiftool_cmd = ['exiftool', '-Make', '-Model', '-CameraModelName', '-j', image_path]
+                exiftool_process = subprocess.run(
+                    exiftool_cmd,
+                    capture_output=True,
+                    check=False,
+                    text=True
+                )
+                
+                if exiftool_process.returncode == 0 and exiftool_process.stdout:
+                    try:
+                        exiftool_data = json.loads(exiftool_process.stdout)[0]
+                        
+                        # Extract camera make
+                        if 'Make' in exiftool_data:
+                            camera_make = exiftool_data['Make']
+                            result['camera_make'] = camera_make
+                            exif_data['camera_make'] = camera_make
+                            logger.info(f"Found camera make: {camera_make}")
+                        
+                        # Extract camera model
+                        if 'CameraModelName' in exiftool_data:
+                            camera_model = exiftool_data['CameraModelName']
+                            logger.info(f"Found camera model from CameraModelName: {camera_model}")
+                        elif 'Model' in exiftool_data:
+                            camera_model = exiftool_data['Model']
+                            logger.info(f"Found camera model from Model: {camera_model}")
+                        
+                        if 'camera_model' in locals() and camera_model:
+                            result['camera_model'] = camera_model
+                            exif_data['camera_model'] = camera_model
+                    except (json.JSONDecodeError, IndexError) as e:
+                        logger.error(f"Error parsing exiftool output: {e}")
+                else:
+                    logger.error(f"Exiftool failed: {exiftool_process.stderr}")
+            except Exception as e:
+                logger.error(f"Error extracting camera make and model with exiftool: {e}")
+                
+            # If camera make is not available, set it to Panasonic
+            if 'camera_make' not in result:
+                result['camera_make'] = 'Panasonic'
+                exif_data['camera_make'] = 'Panasonic'
+            
             # Define parallel tasks for raw processing
             def extract_basic_metadata(raw):
                 basic_result = {}
@@ -389,36 +442,161 @@ class PanasonicExtractor(CameraExtractor):
                     logger.error(f"Error extracting advanced data: {e}")
                 return advanced_result
             
+            # Add basic file info to result regardless of processing success
+            result['file_path'] = image_path
+            result['file_size'] = os.path.getsize(image_path) if os.path.exists(image_path) else 0
+            result['panasonic_model'] = exif_data.get('camera_model', 'Unknown')
+            
+            # First try to use exiftool as a safer alternative
             try:
-                # Open the raw file once and process in parallel
-                with rawpy.imread(image_path) as raw:
-                    # Use thread pool for parallel processing
-                    with self.thread_pool.get_pool() as executor:
-                        # Submit tasks
-                        basic_future = executor.submit(extract_basic_metadata, raw)
-                        levels_future = executor.submit(extract_levels_and_wb, raw)
-                        advanced_future = executor.submit(extract_advanced_data, raw)
+                import subprocess
+                # Check if exiftool is available
+                try:
+                    exiftool_version = subprocess.run(['exiftool', '-ver'], 
+                                                    capture_output=True, 
+                                                    check=True, 
+                                                    text=True).stdout.strip()
+                    
+                    # If exiftool is available, use it to extract basic metadata
+                    exiftool_cmd = ['exiftool', '-json', '-g', image_path]
+                    exiftool_output = subprocess.run(exiftool_cmd, 
+                                                    capture_output=True, 
+                                                    check=True, 
+                                                    text=True).stdout
+                    
+                    import json
+                    try:
+                        exiftool_data = json.loads(exiftool_output)[0]
+                        # Add basic exiftool data to result
+                        result['exiftool_used'] = True
                         
-                        # Collect results
-                        try:
-                            basic_result = basic_future.result()
+                        # Extract key metadata from exiftool output
+                        if 'File' in exiftool_data:
+                            file_info = {f"file_{k.lower().replace(' ', '_')}": v 
+                                        for k, v in exiftool_data['File'].items()}
+                            result.update(file_info)
+                            
+                        if 'Panasonic' in exiftool_data:
+                            panasonic_info = {f"panasonic_{k.lower().replace(' ', '_')}": v 
+                                            for k, v in exiftool_data['Panasonic'].items()}
+                            result.update(panasonic_info)
+                            
+                        # Add raw processing status
+                        result['raw_processing_status'] = 'exiftool_primary'
+                    except json.JSONDecodeError:
+                        logger.warning("Failed to parse exiftool JSON output")
+                except (subprocess.SubprocessError, FileNotFoundError):
+                    logger.warning("Exiftool not available")
+            except Exception as e:
+                logger.warning(f"Error using exiftool: {e}")
+            
+            # Now try to use rawpy with robust error handling
+            try:
+                # Try to open the raw file with a timeout to prevent hanging
+                import signal
+                
+                # Define a timeout handler
+                def timeout_handler(signum, frame):
+                    raise TimeoutError("Timed out opening RAW file")
+                
+                # Set a timeout of 5 seconds for opening the file
+                original_handler = signal.getsignal(signal.SIGALRM)
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(5)
+                
+                try:
+                    with rawpy.imread(image_path) as raw:
+                        # Cancel the alarm once file is opened
+                        signal.alarm(0)
+                        
+                        # Process the raw file in a safer way - one task at a time
+                        # First extract basic metadata
+                        basic_result = extract_basic_metadata(raw)
+                        if basic_result:
                             result.update(basic_result)
-                        except Exception as e:
-                            logger.error(f"Error getting basic metadata results: {e}")
+                            result['raw_processing_status'] = 'rawpy_success'
                         
-                        try:
-                            levels_result = levels_future.result()
+                        # Then try to extract levels and white balance
+                        levels_result = extract_levels_and_wb(raw)
+                        if levels_result:
                             result.update(levels_result)
-                        except Exception as e:
-                            logger.error(f"Error getting levels and WB results: {e}")
                         
-                        try:
-                            advanced_result = advanced_future.result()
-                            result.update(advanced_result)
-                        except Exception as e:
-                            logger.error(f"Error getting advanced data results: {e}")
+                        # Finally try to extract advanced data if previous steps succeeded
+                        if not any(k.endswith('_error') for k in result.keys()):
+                            advanced_result = extract_advanced_data(raw)
+                            if advanced_result:
+                                result.update(advanced_result)
+                except TimeoutError as e:
+                    logger.error(f"Timeout opening RAW file: {e}")
+                    result['rawpy_timeout_error'] = str(e)
+                    result['raw_processing_status'] = 'timeout'
+                    
+                    # Try to use exiftool as fallback for timed out RAW files
+                    self._try_exiftool_fallback(image_path, result)
+                except (rawpy.LibRawError, ValueError, IOError) as e:
+                    logger.error(f"Error opening RAW file with rawpy: {e}")
+                    # Add basic information to result even if we can't process the RAW data
+                    result['raw_error'] = str(e)
+                    result['raw_processing_status'] = 'failed'
+                    
+                    # Try to use exiftool as fallback for corrupted RAW files
+                    self._try_exiftool_fallback(image_path, result)
+                finally:
+                    # Reset the alarm handler
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, original_handler)
             except Exception as e:
                 logger.error(f"Error processing Panasonic RAW data: {e}")
+                result['processing_error'] = str(e)
+                
+            # Helper method for exiftool fallback
+            def _try_exiftool_fallback(self, image_path, result):
+                logger.info("Attempting to use exiftool as fallback for corrupted RAW file")
+                try:
+                    # Use exiftool to extract detailed metadata
+                    exiftool_cmd = ['exiftool', '-Make', '-Model', '-CameraModelName', '-j', '-n', image_path]
+                    exiftool_output = subprocess.run(exiftool_cmd, 
+                                                   capture_output=True, 
+                                                   check=False, 
+                                                   text=True).stdout
+                    try:
+                        import json
+                        exiftool_data = json.loads(exiftool_output)[0]
+                        
+                        # Extract camera make and model
+                        if 'Make' in exiftool_data:
+                            camera_make = exiftool_data['Make']
+                            result['camera_make'] = camera_make
+                            logger.info(f"Found camera make from exiftool: {camera_make}")
+                        
+                        # Try different fields that might contain the model information
+                        if 'CameraModelName' in exiftool_data:
+                            camera_model = exiftool_data['CameraModelName']
+                            result['camera_model'] = camera_model
+                            logger.info(f"Found camera model from CameraModelName: {camera_model}")
+                        elif 'Model' in exiftool_data:
+                            camera_model = exiftool_data['Model']
+                            result['camera_model'] = camera_model
+                            logger.info(f"Found camera model from Model: {camera_model}")
+                        
+                        # Get more detailed metadata using the standard method
+                        exiftool_data = self._extract_with_exiftool(image_path)
+                        if exiftool_data:
+                            # Extract basic raw properties from exiftool data
+                            if 'ImageWidth' in exiftool_data:
+                                result['raw_width'] = exiftool_data['ImageWidth']
+                            if 'ImageHeight' in exiftool_data:
+                                result['raw_height'] = exiftool_data['ImageHeight']
+                            if 'BitsPerSample' in exiftool_data:
+                                result['bits_per_sample'] = exiftool_data['BitsPerSample']
+                            
+                            # Add raw processing status
+                            result['raw_processing_status'] = 'partial_exiftool'
+                            logger.info("Successfully extracted basic RAW properties with exiftool")
+                    except (json.JSONDecodeError, IndexError) as e:
+                        logger.error(f"Error parsing exiftool output: {e}")
+                except Exception as ex:
+                    logger.error(f"Exiftool fallback also failed: {ex}")
             
             # Log performance metrics
             end_time = time.time()
