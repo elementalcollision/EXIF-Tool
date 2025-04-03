@@ -75,7 +75,7 @@ class EnhancedExifExtractor:
               f"GPU acceleration: {self.use_gpu}")
               
         # Set supported file extensions
-        self.supported_extensions = ['.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic', '.heif', '.nef', '.cr2', '.cr3', '.arw', '.dng', '.raf']
+        self.supported_extensions = ['.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic', '.heif', '.nef', '.cr2', '.cr3', '.arw', '.dng', '.raf', '.proraw']
     
     def extract_exif(self, image_path):
         """Extract EXIF data from an image file using multiple methods"""
@@ -290,18 +290,35 @@ class EnhancedExifExtractor:
             print(f"ExifRead error: {e}")
         
         # Method 3: RAW processing for RAW files using camera-specific extractors
-        if file_ext.lower() in ['.arw', '.nef', '.cr2', '.cr3', '.orf', '.rw2', '.raw', '.dng', '.raf']:
+        if file_ext.lower() in ['.arw', '.nef', '.cr2', '.cr3', '.orf', '.rw2', '.raw', '.dng', '.raf', '.proraw']:
+            print(f"Processing RAW file format: {file_ext}")
             try:
                 print(f"Processing RAW file: {file_ext}")
                 
-                # First, try to get a camera-specific extractor
-                camera_extractor = get_camera_extractor(
-                    file_ext=file_ext,
-                    exif_data=result,
-                    use_gpu=self.use_gpu,
-                    memory_limit=self.memory_limit / self.total_memory,
-                    cpu_cores=self.cpu_cores
-                )
+                # Import camera extractors here to ensure they're loaded
+                try:
+                    from camera_extractors import get_camera_extractor, register_camera_extractor
+                    from camera_extractors import DngExtractor, FujiExtractor, CanonExtractor
+                    
+                    # Ensure specific extractors are registered for these formats
+                    if file_ext.lower() == '.dng':
+                        print("Using DNG-specific extractor")
+                    elif file_ext.lower() == '.raf':
+                        print("Using Fujifilm RAF-specific extractor")
+                    elif file_ext.lower() == '.cr3':
+                        print("Using Canon CR3-specific extractor")
+                    
+                    # First, try to get a camera-specific extractor
+                    camera_extractor = get_camera_extractor(
+                        file_ext=file_ext,
+                        exif_data=result,
+                        use_gpu=self.use_gpu,
+                        memory_limit=self.memory_limit / self.total_memory,
+                        cpu_cores=self.cpu_cores
+                    )
+                except ImportError as import_error:
+                    print(f"Error importing camera extractors: {import_error}")
+                    camera_extractor = None
                 
                 # If we have a camera-specific extractor, use it
                 if camera_extractor:
@@ -324,43 +341,87 @@ class EnhancedExifExtractor:
                 
                 # If no camera-specific extractor or as a fallback, use generic RAW processing
                 else:
-                    with rawpy.imread(image_path) as raw:
-                        # Extract basic RAW metadata
-                        raw_metadata = {
-                            'raw_type': str(raw.raw_type),
-                            'raw_pattern': str(raw.raw_pattern.tolist()) if hasattr(raw, 'raw_pattern') else None,
-                            'black_level': str(raw.black_level) if hasattr(raw, 'black_level') else None,
-                            'white_level': str(raw.white_level) if hasattr(raw, 'white_level') else None,
-                            'color_desc': raw.color_desc.decode('utf-8', errors='ignore') if hasattr(raw, 'color_desc') else None,
-                            'num_colors': raw.num_colors if hasattr(raw, 'num_colors') else None,
-                            'raw_height': raw.sizes.raw_height if hasattr(raw, 'sizes') else None,
-                            'raw_width': raw.sizes.raw_width if hasattr(raw, 'sizes') else None
-                        }
-                        
-                        # Update dimensions if not already set
-                        if 'width' not in result or result['width'] == 0:
-                            result['width'] = raw.sizes.width if hasattr(raw, 'sizes') else 0
-                            result['height'] = raw.sizes.height if hasattr(raw, 'sizes') else 0
-                            result['aspect_ratio'] = round(result['width'] / result['height'], 2) if result['height'] > 0 else 0
-                            print(f"RAW dimensions: {result['width']}x{result['height']}")
-                        
-                        # Add RAW metadata to result
-                        for key, value in raw_metadata.items():
-                            if value is not None:
-                                result[key] = value
-                        
-                        # Try to extract thumbnail
-                        try:
-                            thumb = raw.extract_thumb()
-                            if thumb and hasattr(thumb, 'format'):
-                                result['has_thumbnail'] = True
-                                result['thumbnail_format'] = thumb.format
-                                print(f"Extracted thumbnail in {thumb.format} format")
-                        except Exception as thumb_error:
-                            result['has_thumbnail'] = False
-                            print(f"Thumbnail extraction error: {thumb_error}")
+                    print(f"No specific extractor found for {file_ext}, using generic RAW processing")
+                    try:
+                        with rawpy.imread(image_path) as raw:
+                            # Extract basic RAW metadata
+                            raw_metadata = {
+                                'raw_type': str(raw.raw_type),
+                                'raw_pattern': str(raw.raw_pattern.tolist()) if hasattr(raw, 'raw_pattern') else None,
+                                'black_level': str(raw.black_level) if hasattr(raw, 'black_level') else None,
+                                'white_level': str(raw.white_level) if hasattr(raw, 'white_level') else None,
+                                'color_desc': raw.color_desc.decode('utf-8', errors='ignore') if hasattr(raw, 'color_desc') else None,
+                                'num_colors': raw.num_colors if hasattr(raw, 'num_colors') else None,
+                                'raw_height': raw.sizes.raw_height if hasattr(raw, 'sizes') else None,
+                                'raw_width': raw.sizes.raw_width if hasattr(raw, 'sizes') else None
+                            }
+                            
+                            # Update dimensions if not already set
+                            if 'width' not in result or result['width'] == 0:
+                                result['width'] = raw.sizes.width if hasattr(raw, 'sizes') else 0
+                                result['height'] = raw.sizes.height if hasattr(raw, 'sizes') else 0
+                                result['aspect_ratio'] = round(result['width'] / result['height'], 2) if result['height'] > 0 else 0
+                                print(f"RAW dimensions: {result['width']}x{result['height']}")
+                            
+                            # Add RAW metadata to result
+                            for key, value in raw_metadata.items():
+                                if value is not None:
+                                    result[key] = value
+                            
+                            # Try to extract thumbnail
+                            try:
+                                thumb = raw.extract_thumb()
+                                if thumb and hasattr(thumb, 'format'):
+                                    result['has_thumbnail'] = True
+                                    result['thumbnail_format'] = thumb.format
+                                    print(f"Extracted thumbnail in {thumb.format} format")
+                            except Exception as thumb_error:
+                                result['has_thumbnail'] = False
+                                print(f"Thumbnail extraction error: {thumb_error}")
+                    except Exception as rawpy_error:
+                        print(f"Error processing RAW file with rawpy: {rawpy_error}")
             except Exception as raw_error:
                 print(f"RAW processing error: {raw_error}")
+                # Last resort: try to use exiftool if available
+                try:
+                    import subprocess
+                    print("Attempting to use exiftool as a last resort...")
+                    result_bytes = subprocess.check_output(['exiftool', '-j', image_path])
+                    import json
+                    exiftool_data = json.loads(result_bytes.decode('utf-8'))[0]
+                    
+                    # Map some common exiftool fields to our standard format
+                    exiftool_mapping = {
+                        'Make': 'camera_make',
+                        'Model': 'camera_model',
+                        'DateTimeOriginal': 'date_taken',
+                        'ShutterSpeed': 'exposure_time',
+                        'Aperture': 'f_number',
+                        'ISO': 'iso',
+                        'FocalLength': 'focal_length',
+                        'Flash': 'flash',
+                        'ExposureProgram': 'exposure_program',
+                        'MeteringMode': 'metering_mode',
+                        'WhiteBalance': 'white_balance',
+                        'GPSLatitude': 'gps_latitude',
+                        'GPSLongitude': 'gps_longitude',
+                        'GPSAltitude': 'gps_altitude',
+                        'ImageWidth': 'width',
+                        'ImageHeight': 'height'
+                    }
+                    
+                    for exiftool_field, our_field in exiftool_mapping.items():
+                        if exiftool_field in exiftool_data:
+                            result[our_field] = exiftool_data[exiftool_field]
+                    
+                    # Add all other exiftool fields with a prefix
+                    for key, value in exiftool_data.items():
+                        if key not in exiftool_mapping.values():
+                            result[f'exiftool_{key.lower()}'] = value
+                            
+                    print(f"Added {len(exiftool_data)} fields from exiftool")
+                except Exception as exiftool_error:
+                    print(f"Exiftool fallback failed: {exiftool_error}")
         
         # Add camera info if available
         if 'camera_make' in result and 'camera_model' in result:
@@ -369,6 +430,25 @@ class EnhancedExifExtractor:
             result['camera'] = result['camera_make']
         elif 'camera_model' in result:
             result['camera'] = result['camera_model']
+            
+        # Special handling for Apple ProRAW files
+        if file_ext.lower() == '.dng' and ('camera_make' in result and 'APPLE' in result['camera_make'].upper() or 
+                                          'camera_model' in result and 'IPHONE' in result['camera_model'].upper()):
+            print("Detected Apple ProRAW file")
+            result['file_type'] = 'PRORAW'  # Mark as ProRAW instead of DNG
+            
+            # Try to extract Apple-specific metadata if not already done
+            if not any(key.startswith('apple_') for key in result.keys()):
+                try:
+                    # Get the Apple RAW extractor
+                    apple_extractor = get_camera_extractor('APPLE')
+                    if apple_extractor:
+                        apple_metadata = apple_extractor.extract_metadata(image_path, result)
+                        if apple_metadata:
+                            result.update(apple_metadata)
+                            print(f"Added {len(apple_metadata)} Apple-specific fields")
+                except Exception as apple_error:
+                    print(f"Error extracting Apple ProRAW metadata: {apple_error}")
         
         print(f"Extracted {len(result)} fields")
         return result
@@ -397,7 +477,8 @@ def test_extractor(image_path, use_gpu=False):
         priority_fields = [
             'file_name', 'camera_make', 'camera_model', 'date_taken', 
             'exposure_time', 'f_number', 'iso', 'focal_length',
-            'width', 'height', 'sony_arw_version', 'sony_raw_black_level', 'sony_raw_white_level'
+            'width', 'height', 'sony_arw_version', 'sony_raw_black_level', 'sony_raw_white_level',
+            'apple_proraw', 'apple_hdr', 'apple_deep_fusion', 'apple_night_mode'
         ]
         
         # Print priority fields first

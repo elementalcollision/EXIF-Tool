@@ -14,8 +14,15 @@ rawpy>=0.17.0
 torch>=2.0.0
 # CoreML for Metal acceleration
 coremltools>=6.0
+# macOS-specific libraries for Apple RAW support
+pyobjc>=9.0.1  # For CoreImage API access
+pyobjc-framework-Quartz>=9.0.1  # For CoreImage processing
 # Database support
-sqlite3>=2.6.0
+# sqlite3 is part of the Python standard library
+# Visualization enhancements
+scipy>=1.10.0
+cartopy>=0.21.0  # For map visualizations
+# functools.lru_cache is part of the Python standard library
 # Apple-optimized TensorFlow (optional)
 # tensorflow-macos>=2.9.0
 # tensorflow-metal>=0.7.0
