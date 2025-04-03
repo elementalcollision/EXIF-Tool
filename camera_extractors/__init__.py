@@ -6,15 +6,18 @@ Provides modular support for camera-specific EXIF extraction
 
 from .base_extractor import CameraExtractor
 from .sony_extractor import SonyExtractor
+from .nikon_extractor import NikonExtractor
 from .extractor_factory import get_camera_extractor, register_camera_extractor
 
 # Register built-in camera extractors
 register_camera_extractor('SONY', SonyExtractor)
+register_camera_extractor('NIKON', NikonExtractor)
 
 # Export public API
 __all__ = [
     'CameraExtractor',
     'SonyExtractor',
+    'NikonExtractor',
     'get_camera_extractor',
     'register_camera_extractor'
 ]
