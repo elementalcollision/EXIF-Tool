@@ -75,7 +75,7 @@ class EnhancedExifExtractor:
               f"GPU acceleration: {self.use_gpu}")
               
         # Set supported file extensions
-        self.supported_extensions = ['.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic', '.heif', '.nef', '.cr2', '.arw']
+        self.supported_extensions = ['.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic', '.heif', '.nef', '.cr2', '.cr3', '.arw', '.dng']
     
     def extract_exif(self, image_path):
         """Extract EXIF data from an image file using multiple methods"""
@@ -290,7 +290,7 @@ class EnhancedExifExtractor:
             print(f"ExifRead error: {e}")
         
         # Method 3: RAW processing for RAW files using camera-specific extractors
-        if file_ext.lower() in ['.arw', '.nef', '.cr2', '.cr3', '.orf', '.rw2', '.raw']:
+        if file_ext.lower() in ['.arw', '.nef', '.cr2', '.cr3', '.orf', '.rw2', '.raw', '.dng']:
             try:
                 print(f"Processing RAW file: {file_ext}")
                 
