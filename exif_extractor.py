@@ -290,7 +290,7 @@ class EnhancedExifExtractor:
             print(f"ExifRead error: {e}")
         
         # Method 3: RAW processing for RAW files using camera-specific extractors
-        if file_ext.lower() in ['.arw', '.nef', '.cr2', '.orf', '.rw2', '.raw']:
+        if file_ext.lower() in ['.arw', '.nef', '.cr2', '.cr3', '.orf', '.rw2', '.raw']:
             try:
                 print(f"Processing RAW file: {file_ext}")
                 
