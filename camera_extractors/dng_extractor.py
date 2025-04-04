@@ -118,11 +118,19 @@ class DngExtractor(CameraExtractor):
             'file_path': image_path,
             'file_size': os.path.getsize(image_path) if os.path.exists(image_path) else 0,
             'dng_model': exif_data.get('camera_model', 'Unknown'),
-            'dng_make': exif_data.get('camera_make', 'Unknown')
+            'dng_make': exif_data.get('camera_make', 'Unknown'),
+            'dng_opencv_compatible': True  # Default to True, will be set to False if issues detected
         }
         
         # First try to use exiftool as a safer alternative
         try:
+            # Add specific handling for OpenCV errors with DNG files
+            if 'opencv' in exif_data.get('processing_errors', []):
+                print(f"Skipping OpenCV processing for DNG file due to known compatibility issues: {image_path}")
+                result['dng_opencv_compatible'] = False
+                result['processing_method'] = 'exiftool_only'
+                # Still try to use exiftool for metadata
+            
             if self._check_exiftool():
                 print("Using exiftool for DNG metadata extraction")
                 exiftool_data = self._run_exiftool(image_path)
@@ -150,56 +158,116 @@ class DngExtractor(CameraExtractor):
         
         # Process DNG file with rawpy with robust error handling
         try:
-            # Try to open the raw file with a timeout to prevent hanging
-            import signal
+            # Try to open the raw file with a thread-safe timeout approach
+            import threading
+            import concurrent.futures
             
-            # Define a timeout handler
-            def timeout_handler(signum, frame):
-                raise TimeoutError("Timed out opening DNG file")
+            # Define a function to open the raw file
+            def open_raw_file(path):
+                try:
+                    return rawpy.imread(path)
+                except Exception as e:
+                    print(f"Error in open_raw_file: {e}")
+                    raise
             
-            # Set a timeout of 5 seconds for opening the file
-            original_handler = signal.getsignal(signal.SIGALRM)
-            signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(5)
-            
+            # Use a thread pool with a timeout instead of signals
+            # This is thread-safe and works in any thread
             try:
-                with rawpy.imread(image_path) as raw:
-                    # Cancel the alarm once file is opened
-                    signal.alarm(0)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    # Submit the task and wait with a timeout
+                    future = executor.submit(open_raw_file, image_path)
+                    raw = future.result(timeout=10)  # Increased timeout to 10 seconds
                     print(f"Processing DNG file: {image_path}")
                     
                     try:
-                        # Get raw image data - use sampling to reduce memory usage
-                        raw_image = raw.raw_image.copy()
+                        # Add specific handling for OpenCV-related operations
+                        try:
+                            # Check if raw has raw_image attribute
+                            if not hasattr(raw, 'raw_image'):
+                                print(f"Raw file does not have raw_image attribute: {image_path}")
+                                result['dng_opencv_compatible'] = False
+                                result['raw_image_error'] = "No raw_image attribute"
+                                # Add basic information that doesn't require raw_image
+                                if hasattr(raw, 'sizes'):
+                                    result['dng_full_width'] = raw.sizes.width
+                                    result['dng_full_height'] = raw.sizes.height
+                                    print(f"DNG dimensions: {result['dng_full_width']}x{result['dng_full_height']}")
+                                    result['raw_dimensions_extracted'] = True
+                                raise ValueError("No raw_image attribute")
+                                
+                            # Get raw image data - use sampling to reduce memory usage
+                            try:
+                                raw_image = raw.raw_image.copy()
+                            except Exception as copy_error:
+                                print(f"Error copying raw image: {copy_error}")
+                                # Try without copy
+                                raw_image = raw.raw_image
+                            
+                            # For large images, sample to reduce memory usage
+                            if raw_image.size > 20_000_000:  # For very large sensors
+                                sample_rate = max(1, int(np.sqrt(raw_image.size / 1_000_000)))
+                                try:
+                                    sampled_image = raw_image[::sample_rate, ::sample_rate]
+                                    print(f"Sampling raw image at 1/{sample_rate} for stats calculation")
+                                except Exception as sampling_error:
+                                    print(f"Error sampling image: {sampling_error}")
+                                    # Use a smaller portion of the image
+                                    try:
+                                        max_size = min(1000, min(raw_image.shape))
+                                        sampled_image = raw_image[:max_size, :max_size]
+                                        print(f"Using first {max_size}x{max_size} pixels for analysis")
+                                    except:
+                                        # Last resort - just use a tiny slice
+                                        sampled_image = raw_image[:100, :100]
+                            else:
+                                sampled_image = raw_image
+                        except Exception as opencv_error:
+                            # Handle OpenCV compatibility issues with DNG files
+                            error_msg = str(opencv_error)
+                            if 'opencv' in error_msg.lower() or 'imread_' in error_msg or 'original_ptr == real_mat.data' in error_msg:
+                                print(f"OpenCV compatibility issue detected with DNG file: {image_path}")
+                                print(f"Error details: {error_msg}")
+                                result['dng_opencv_compatible'] = False
+                                result['opencv_error'] = error_msg
+                                # Skip further OpenCV processing
+                                raise
                         
-                        # For large images, sample to reduce memory usage
-                        if raw_image.size > 20_000_000:  # For very large sensors
-                            sample_rate = max(1, int(np.sqrt(raw_image.size / 1_000_000)))
-                            sampled_image = raw_image[::sample_rate, ::sample_rate]
-                            print(f"Sampling raw image at 1/{sample_rate} for stats calculation")
-                        else:
-                            sampled_image = raw_image
-                        
-                        # Get basic stats about the raw image
-                        raw_min = np.min(sampled_image)
-                        raw_max = np.max(sampled_image)
-                        print(f"Raw image shape: {raw_image.shape}")
-                        print(f"Raw image min/max values: {raw_min}/{raw_max}")
-                        
-                        # Calculate histogram with reduced bins for efficiency
-                        histogram, _ = np.histogram(sampled_image.flatten(), bins=256)
-                        
-                        # DNG specific fields
-                        dng_metadata = {
-                            'dng_raw_image_shape': str(raw_image.shape),
-                            'dng_raw_min_value': int(raw_min),
-                            'dng_raw_max_value': int(raw_max),
-                            'dng_raw_histogram_mean': float(np.mean(histogram)),
-                            'dng_raw_histogram_std': float(np.std(histogram)),
-                            'dng_raw_dynamic_range': float(np.log2(raw_max - raw_min + 1)) if raw_max > raw_min else 0,
-                            'dng_raw_black_level': int(raw.black_level) if hasattr(raw, 'black_level') else 0,
-                            'dng_raw_white_level': int(raw.white_level) if hasattr(raw, 'white_level') else 0
-                        }
+                        # Get basic stats about the raw image with error handling
+                        try:
+                            raw_min = np.min(sampled_image)
+                            raw_max = np.max(sampled_image)
+                            print(f"Raw image shape: {raw_image.shape}")
+                            print(f"Raw image min/max values: {raw_min}/{raw_max}")
+                            
+                            # Calculate histogram with reduced bins for efficiency
+                            try:
+                                histogram, _ = np.histogram(sampled_image.flatten(), bins=256)
+                                histogram_mean = float(np.mean(histogram))
+                                histogram_std = float(np.std(histogram))
+                            except Exception as hist_error:
+                                print(f"Error calculating histogram: {hist_error}")
+                                histogram_mean = 0
+                                histogram_std = 0
+                            
+                            # DNG specific fields
+                            dng_metadata = {
+                                'dng_raw_image_shape': str(raw_image.shape),
+                                'dng_raw_min_value': int(raw_min),
+                                'dng_raw_max_value': int(raw_max),
+                                'dng_raw_histogram_mean': histogram_mean,
+                                'dng_raw_histogram_std': histogram_std,
+                                'dng_raw_dynamic_range': float(np.log2(raw_max - raw_min + 1)) if raw_max > raw_min else 0,
+                                'dng_raw_black_level': int(raw.black_level) if hasattr(raw, 'black_level') else 0,
+                                'dng_raw_white_level': int(raw.white_level) if hasattr(raw, 'white_level') else 0
+                            }
+                        except Exception as stats_error:
+                            print(f"Error calculating basic stats: {stats_error}")
+                            # Provide minimal metadata
+                            dng_metadata = {
+                                'dng_raw_image_shape': str(raw_image.shape) if 'raw_image' in locals() else 'unknown',
+                                'dng_raw_black_level': int(raw.black_level) if hasattr(raw, 'black_level') else 0,
+                                'dng_raw_white_level': int(raw.white_level) if hasattr(raw, 'white_level') else 0
+                            }
                         
                         # Add DNG metadata to result
                         result.update(dng_metadata)
@@ -272,18 +340,21 @@ class DngExtractor(CameraExtractor):
                             except Exception as gpu_error:
                                 print(f"GPU processing error: {gpu_error}")
                                 result['gpu_error'] = str(gpu_error)
-            except TimeoutError as e:
+            except concurrent.futures.TimeoutError as e:
                 print(f"Timeout opening DNG file: {e}")
                 result['rawpy_timeout_error'] = str(e)
                 result['raw_processing_status'] = 'timeout'
+            except Exception as future_error:
+                print(f"Error in future execution: {future_error}")
+                result['future_error'] = str(future_error)
+                result['raw_processing_status'] = 'future_error'
             except (rawpy.LibRawError, ValueError, IOError) as e:
                 print(f"Error opening DNG file with rawpy: {e}")
                 result['rawpy_error'] = str(e)
                 result['raw_processing_status'] = 'failed'
             finally:
-                # Reset the alarm handler
-                signal.alarm(0)
-                signal.signal(signal.SIGALRM, original_handler)
+                # No signal handlers to restore in this approach
+                pass
         except ImportError:
             print("rawpy not available for DNG processing")
             result['rawpy_import_error'] = "rawpy module not available"

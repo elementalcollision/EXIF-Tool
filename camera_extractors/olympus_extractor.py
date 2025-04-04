@@ -355,9 +355,21 @@ class OlympusExtractor(CameraExtractor):
             
             def extract_raw_stats(raw):
                 stats_result = {}
+                # Define variables at this scope level to make them accessible to GPU code
+                sampled_image = None
+                raw_min = 0
+                raw_max = 0
+                
                 try:
+                    # Define variables at this scope level to make them accessible to GPU code
+                    sampled_image = None
+                    raw_min = 0
+                    raw_max = 0
+                    
+
                     # Define a function to process safely
                     def process_stats():
+                        nonlocal sampled_image, raw_min, raw_max  # Use nonlocal to modify outer variables
                         # Get raw image data - use sampling to reduce memory usage
                         raw_image = raw.raw_image
                         
@@ -513,22 +525,24 @@ class OlympusExtractor(CameraExtractor):
             # Process ORF file with rawpy with robust error handling
             try:
                 import rawpy
-                # Try to open the raw file with a timeout to prevent hanging
-                import signal
+                # Try to open the raw file with a thread-safe timeout approach
+                import threading
+                import concurrent.futures
                 
-                # Define a timeout handler
-                def timeout_handler(signum, frame):
-                    raise TimeoutError("Timed out opening RAW file")
+                # Define a function to open the raw file
+                def open_raw_file(path):
+                    return rawpy.imread(path)
                 
-                # Set a timeout of 5 seconds for opening the file
-                original_handler = signal.getsignal(signal.SIGALRM)
-                signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(5)
-                
+                # Use a thread pool with a timeout instead of signals
+                # This is thread-safe and works in any thread
                 try:
-                    with rawpy.imread(image_path) as raw:
-                        # Cancel the alarm once file is opened
-                        signal.alarm(0)
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        # Submit the task and wait with a timeout
+                        future = executor.submit(open_raw_file, image_path)
+                        raw = future.result(timeout=5)  # 5 second timeout
+                        
+                        # Continue processing with the opened raw file
+                        # No need to cancel any alarm
                         logger.info(f"Processing Olympus ORF file: {image_path}")
                         
                         # Process the raw file in a safer way - one task at a time
@@ -548,7 +562,7 @@ class OlympusExtractor(CameraExtractor):
                             stats_result = extract_raw_stats(raw)
                             if stats_result:
                                 result.update(stats_result)
-                except TimeoutError as e:
+                except concurrent.futures.TimeoutError as e:
                     logger.error(f"Timeout opening RAW file: {e}")
                     result['rawpy_timeout_error'] = str(e)
                     result['raw_processing_status'] = 'timeout'
