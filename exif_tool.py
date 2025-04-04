@@ -22,6 +22,7 @@ import rawpy
 import datetime
 import time
 import io
+import json
 from PIL import Image, ImageFile
 from exif_db import ExifDatabase
 # Disable DecompressionBombWarning
@@ -70,7 +71,7 @@ print(f"GPU acceleration (Metal): {'Available' if GPU_AVAILABLE else 'Not availa
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                             QProgressBar, QTabWidget, QTableWidget, QTableWidgetItem,
-                            QComboBox, QMessageBox, QCheckBox, QDialog)
+                            QComboBox, QMessageBox, QCheckBox, QDialog, QScrollArea)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap, QIcon
 import matplotlib
@@ -200,7 +201,24 @@ class ExifProcessor:
     """Class for processing EXIF data from photos"""
     
     def __init__(self, use_db=True, db_path=None):
-        self.supported_extensions = ['.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic', '.heif', '.nef', '.cr2', '.cr3', '.arw', '.dng', '.raf']
+        self.supported_extensions = [
+            # Common image formats
+            '.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic', '.heif', 
+            # Camera RAW formats
+            '.nef',  # Nikon
+            '.cr2', '.cr3',  # Canon
+            '.arw',  # Sony
+            '.dng',  # Adobe/Apple/Leica
+            '.raf',  # Fujifilm
+            '.rw2',  # Panasonic
+            '.orf',  # Olympus
+            '.pef',  # Pentax
+            '.srw',  # Samsung
+            '.3fr',  # Hasselblad
+            '.mef',  # Mamiya
+            '.rwl',  # Leica
+            '.mrw'   # Minolta
+        ]
         self.exif_data = []
         self.csv_path = None
         self.use_db = use_db
@@ -1436,6 +1454,32 @@ class ExifToolGUI(QMainWindow):
         self.gpu_image_processing = GPU_AVAILABLE
         self.gpu_data_analysis = GPU_AVAILABLE
         
+        # Set up event handling for application close
+        app = QApplication.instance()
+        app.aboutToQuit.connect(self.save_preferences)
+        
+        # Define visualizable fields (fields that are useful for visualization)
+        self.visualizable_fields = [
+            'file_name', 'file_path', 'file_type', 'file_size',
+            'camera_make', 'camera_model', 'lens_model',
+            'focal_length', 'f_number', 'iso', 'exposure_time', 'shutter_speed',
+            'exposure_program', 'metering_mode', 'white_balance',
+            'date_time', 'gps_latitude', 'gps_longitude', 'altitude',
+            'width', 'height', 'orientation',
+            'flash', 'scene_type', 'scene_capture_type'
+        ]
+        
+        # User preferences file path
+        self.config_dir = os.path.join(os.path.expanduser("~"), ".exif_tool")
+        self.preferences_file = os.path.join(self.config_dir, "preferences.json")
+        
+        # Create config directory if it doesn't exist
+        if not os.path.exists(self.config_dir):
+            os.makedirs(self.config_dir, exist_ok=True)
+        
+        # Load saved preferences or use defaults
+        self.load_preferences()
+        
         # Initialize enhanced visualizer with GPU acceleration if available
         self.visualizer = EnhancedVisualizer(
             use_gpu=self.use_gpu,
@@ -1470,6 +1514,12 @@ class ExifToolGUI(QMainWindow):
         self.export_csv_btn.setEnabled(False)
         controls_layout.addWidget(self.export_csv_btn)
         
+        # Add field selector button
+        self.field_selector_btn = QPushButton("Select Fields")
+        self.field_selector_btn.clicked.connect(self.show_field_selector)
+        self.field_selector_btn.setEnabled(False)
+        controls_layout.addWidget(self.field_selector_btn)
+        
         # Add settings button
         self.settings_btn = QPushButton("Settings")
         self.settings_btn.clicked.connect(self.show_settings)
@@ -1494,6 +1544,13 @@ class ExifToolGUI(QMainWindow):
         data_layout = QVBoxLayout()
         
         self.data_table = QTableWidget()
+        # Enable sorting
+        self.data_table.setSortingEnabled(True)
+        # Connect header click to custom sort function
+        self.data_table.horizontalHeader().sectionClicked.connect(self.on_header_clicked)
+        # Track current sort order for each column
+        self.sort_orders = {}
+        
         data_layout.addWidget(self.data_table)
         
         self.data_tab.setLayout(data_layout)
@@ -1637,6 +1694,10 @@ class ExifToolGUI(QMainWindow):
         
         # Create and show new dialog if none exists
         self.config_dialog = ConfigDialog(self)
+        
+        # Connect the dialog's accepted signal to save preferences
+        self.config_dialog.accepted.connect(self.save_preferences)
+        
         self.config_dialog.show()
     
     def process_directory(self, directory_path):
@@ -1687,6 +1748,7 @@ class ExifToolGUI(QMainWindow):
         
         if exif_data:
             self.export_csv_btn.setEnabled(True)
+            self.field_selector_btn.setEnabled(True)
             
             # Show resource usage summary
             cores_info = f"Used {self.cpu_cores}/{self.total_cores} CPU cores"
@@ -1823,6 +1885,9 @@ class ExifToolGUI(QMainWindow):
     
     def update_data_table(self):
         """Update the data table with EXIF data"""
+        # Temporarily disable sorting while updating the table
+        self.data_table.setSortingEnabled(False)
+        
         df = self.analyzer.df
         
         if df.empty:
@@ -1840,13 +1905,14 @@ class ExifToolGUI(QMainWindow):
                     normalized_columns = list(row['normalized'].keys())
                     break
         
-        # Prepare columns - regular columns plus normalized ones
-        regular_columns = [col for col in df.columns if col != 'normalized']
-        all_columns = regular_columns.copy()
+        # Filter regular columns to only show selected fields
+        all_columns = [col for col in df.columns if col != 'normalized' and col in self.selected_fields]
         
+        # Add selected normalized columns with a prefix if available
         if has_normalized and normalized_columns:
-            # Add normalized columns with a prefix
-            all_columns.extend([f"norm_{col}" for col in normalized_columns])
+            selected_norm_fields = [field for field in normalized_columns 
+                                  if f"norm_{field}" in self.selected_fields]
+            all_columns.extend([f"norm_{col}" for col in selected_norm_fields])
         
         # Set up table
         self.data_table.setRowCount(len(df))
@@ -1864,9 +1930,9 @@ class ExifToolGUI(QMainWindow):
                 'file_type' in row and str(row['file_type']).upper() in ['DNG', 'PRORAW']):
                 has_apple_proraw = True
             
-            # Collect Apple-specific fields
-            for col in regular_columns:
-                if col.startswith('apple_') and col not in apple_fields:
+            # Collect Apple-specific fields that are selected for display
+            for col in [c for c in df.columns if c != 'normalized']:
+                if col.startswith('apple_') and col not in apple_fields and col in self.selected_fields:
                     apple_fields.append(col)
                     has_apple_proraw = True
         
@@ -1887,22 +1953,12 @@ class ExifToolGUI(QMainWindow):
         
         # Fill table with data
         for i, row in df.iterrows():
-            # Regular columns
-            for j, col in enumerate(regular_columns):
-                item = QTableWidgetItem(str(row[col]))
-                
-                # Highlight Apple-specific fields
-                if col.startswith('apple_'):
-                    item.setBackground(Qt.GlobalColor.lightGray)
-                    item.setToolTip("Apple ProRAW specific field")
-                
-                self.data_table.setItem(i, j, item)
-            
-            # Normalized columns if available
-            if has_normalized and pd.notna(row.get('normalized')) and isinstance(row['normalized'], dict):
-                for k, norm_field in enumerate(normalized_columns):
-                    j = len(regular_columns) + k  # Column index after regular columns
-                    if norm_field in row['normalized']:
+            # Regular columns that are selected for display
+            for j, col in enumerate(all_columns):
+                # Handle normalized fields
+                if col.startswith('norm_') and has_normalized:
+                    norm_field = col[5:]  # Remove 'norm_' prefix
+                    if pd.notna(row.get('normalized')) and isinstance(row['normalized'], dict) and norm_field in row['normalized']:
                         norm_data = row['normalized'][norm_field]
                         value = norm_data.get('value', '') if isinstance(norm_data, dict) else norm_data
                         item = QTableWidgetItem(str(value))
@@ -1910,8 +1966,22 @@ class ExifToolGUI(QMainWindow):
                         if isinstance(norm_data, dict) and 'source_field' in norm_data:
                             item.setToolTip(f"Source field: {norm_data['source_field']}")
                         self.data_table.setItem(i, j, item)
+                # Handle regular fields
+                else:
+                    if col in row:
+                        item = QTableWidgetItem(str(row[col]))
+                        
+                        # Highlight Apple-specific fields
+                        if col.startswith('apple_'):
+                            item.setBackground(Qt.GlobalColor.lightGray)
+                            item.setToolTip("Apple ProRAW specific field")
+                        
+                        self.data_table.setItem(i, j, item)
         
         self.data_table.resizeColumnsToContents()
+        
+        # Re-enable sorting after table is populated
+        self.data_table.setSortingEnabled(True)
     
     def update_summary(self):
         """Update the summary tab with statistics"""
@@ -1954,22 +2024,25 @@ class ExifToolGUI(QMainWindow):
         
         # Use the enhanced visualizer with GPU acceleration if available
         try:
+            # Create a copy of the dataframe to avoid unhashable type error
+            df_copy = self.analyzer.df.copy()
+            
             if viz_type == "Camera Distribution":
-                fig = self.visualizer.plot_camera_distribution(self.analyzer.df, self.figure)
+                fig = self.visualizer.plot_camera_distribution(df_copy, self.figure)
             elif viz_type == "Focal Length Distribution":
-                fig = self.visualizer.plot_focal_length_distribution(self.analyzer.df, self.figure)
+                fig = self.visualizer.plot_focal_length_distribution(df_copy, self.figure)
             elif viz_type == "Aperture Distribution":
-                fig = self.visualizer.plot_aperture_distribution(self.analyzer.df, self.figure)
+                fig = self.visualizer.plot_aperture_distribution(df_copy, self.figure)
             elif viz_type == "ISO Distribution":
-                fig = self.visualizer.plot_iso_distribution(self.analyzer.df, self.figure)
+                fig = self.visualizer.plot_iso_distribution(df_copy, self.figure)
             elif viz_type == "Time of Day Distribution":
-                fig = self.visualizer.plot_time_of_day(self.analyzer.df, self.figure)
+                fig = self.visualizer.plot_time_of_day(df_copy, self.figure)
             elif viz_type == "Location Map":
-                fig = self.visualizer.plot_map(self.analyzer.df, self.figure)
+                fig = self.visualizer.plot_map(df_copy, self.figure)
             elif viz_type == "Aperture vs Focal Length":
-                fig = self.visualizer.plot_heatmap(self.analyzer.df, "focal_length", "f_number", self.figure)
+                fig = self.visualizer.plot_heatmap(df_copy, "focal_length", "f_number", self.figure)
             elif viz_type == "ISO vs Time of Day":
-                fig = self.visualizer.plot_heatmap(self.analyzer.df, "hour", "iso", self.figure)
+                fig = self.visualizer.plot_heatmap(df_copy, "hour", "iso", self.figure)
             else:
                 fig = None
             
@@ -2034,6 +2107,135 @@ class ExifToolGUI(QMainWindow):
                 QMessageBox.information(self, "Success", f"Visualization exported to {file_path}")
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Failed to export visualization: {str(e)}")
+                
+    def show_field_selector(self):
+        """Show dialog to select which fields to display"""
+        # Create field selector dialog
+        field_dialog = QDialog(self)
+        field_dialog.setWindowTitle("Select Fields to Display")
+        field_dialog.setMinimumWidth(400)
+        field_dialog.setMinimumHeight(500)
+        
+        layout = QVBoxLayout()
+        
+        # Instructions
+        instructions = QLabel("Select fields to display in the data table:")
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+        
+        # Get all available fields from the data
+        all_fields = []
+        if not self.analyzer.df.empty:
+            # Regular fields
+            all_fields = [col for col in self.analyzer.df.columns if col != 'normalized']
+            
+            # Add normalized fields if available
+            if 'normalized' in self.analyzer.df.columns:
+                for i, row in self.analyzer.df.iterrows():
+                    if pd.notna(row['normalized']) and isinstance(row['normalized'], dict):
+                        norm_fields = list(row['normalized'].keys())
+                        all_fields.extend([f"norm_{field}" for field in norm_fields])
+                        break
+        
+        # Remove duplicates and sort
+        all_fields = sorted(list(set(all_fields)))
+        
+        # Create scrollable area for checkboxes
+        scroll_area = QWidget()
+        scroll_layout = QVBoxLayout(scroll_area)
+        
+        # Add checkboxes for each field
+        self.field_checkboxes = {}
+        
+        # Add "Select All" checkbox
+        select_all_cb = QCheckBox("Select/Deselect All")
+        layout.addWidget(select_all_cb)
+        
+        # Group fields by categories
+        field_categories = {
+            "Basic": ['file_name', 'file_path', 'file_type', 'file_size'],
+            "Camera": ['camera_make', 'camera_model', 'lens_model'],
+            "Exposure": ['focal_length', 'f_number', 'iso', 'exposure_time', 'shutter_speed', 
+                        'exposure_program', 'metering_mode', 'white_balance', 'flash'],
+            "Image": ['width', 'height', 'orientation', 'scene_type', 'scene_capture_type'],
+            "Location": ['gps_latitude', 'gps_longitude', 'altitude', 'location'],
+            "Time": ['date_time', 'create_date', 'modify_date'],
+            "Normalized": [f for f in all_fields if f.startswith('norm_')],
+            "Apple": [f for f in all_fields if f.startswith('apple_')],
+            "Other": []
+        }
+        
+        # Categorize remaining fields
+        for field in all_fields:
+            categorized = False
+            for category, fields in field_categories.items():
+                if field in fields:
+                    categorized = True
+                    break
+            if not categorized and not field.startswith('norm_') and not field.startswith('apple_'):
+                field_categories["Other"].append(field)
+        
+        # Create section for each category
+        for category, fields in field_categories.items():
+            if not fields:  # Skip empty categories
+                continue
+                
+            # Add category header
+            category_label = QLabel(f"<b>{category}</b>")
+            scroll_layout.addWidget(category_label)
+            
+            # Add checkboxes for fields in this category
+            for field in sorted(fields):
+                if field in all_fields:  # Only add if field exists in data
+                    cb = QCheckBox(field)
+                    cb.setChecked(field in self.selected_fields)
+                    self.field_checkboxes[field] = cb
+                    scroll_layout.addWidget(cb)
+            
+            # Add a small spacer after each category
+            spacer = QWidget()
+            spacer.setFixedHeight(10)
+            scroll_layout.addWidget(spacer)
+        
+        # Create scrollable area
+        scroll_widget = QScrollArea()
+        scroll_widget.setWidgetResizable(True)
+        scroll_widget.setWidget(scroll_area)
+        layout.addWidget(scroll_widget)
+        
+        # Connect select all checkbox
+        def toggle_all(state):
+            for cb in self.field_checkboxes.values():
+                cb.setChecked(state == Qt.CheckState.Checked)
+        
+        select_all_cb.stateChanged.connect(toggle_all)
+        
+        # Add buttons
+        button_layout = QHBoxLayout()
+        apply_btn = QPushButton("Apply")
+        cancel_btn = QPushButton("Cancel")
+        
+        button_layout.addWidget(apply_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+        
+        # Set dialog layout
+        field_dialog.setLayout(layout)
+        
+        # Connect buttons
+        def apply_selection():
+            self.selected_fields = [field for field, cb in self.field_checkboxes.items() 
+                                  if cb.isChecked()]
+            self.update_data_table()
+            # Save selected fields to preferences
+            self.save_preferences()
+            field_dialog.accept()
+        
+        apply_btn.clicked.connect(apply_selection)
+        cancel_btn.clicked.connect(field_dialog.reject)
+        
+        # Show dialog
+        field_dialog.exec()
 
 
 
@@ -2043,6 +2245,104 @@ def main():
     window = ExifToolGUI()
     window.show()
     sys.exit(app.exec())
+    
+    
+# Add methods for loading and saving preferences
+def load_preferences(self):
+    """Load user preferences from file"""
+    try:
+        if os.path.exists(self.preferences_file):
+            with open(self.preferences_file, 'r') as f:
+                preferences = json.load(f)
+                
+                # Load selected fields if available
+                if 'selected_fields' in preferences:
+                    self.selected_fields = preferences['selected_fields']
+                else:
+                    # Use default visualizable fields if not found
+                    self.selected_fields = self.visualizable_fields.copy()
+                    
+                # Load other preferences if needed
+                if 'max_image_size' in preferences:
+                    self.max_image_size = preferences['max_image_size']
+                if 'recursive' in preferences:
+                    self.recursive = preferences['recursive']
+                if 'skip_no_exif' in preferences:
+                    self.skip_no_exif = preferences['skip_no_exif']
+                if 'use_gpu' in preferences:
+                    self.use_gpu = preferences['use_gpu'] and GPU_AVAILABLE
+                if 'gpu_image_processing' in preferences:
+                    self.gpu_image_processing = preferences['gpu_image_processing'] and GPU_AVAILABLE
+                if 'gpu_data_analysis' in preferences:
+                    self.gpu_data_analysis = preferences['gpu_data_analysis'] and GPU_AVAILABLE
+                if 'cpu_cores' in preferences:
+                    self.cpu_cores = min(preferences['cpu_cores'], self.total_cores)
+                if 'memory_limit' in preferences:
+                    self.memory_limit = preferences['memory_limit']
+                
+                print(f"Loaded preferences from {self.preferences_file}")
+        else:
+            # Use default visualizable fields if no preferences file
+            self.selected_fields = self.visualizable_fields.copy()
+    except Exception as e:
+        print(f"Error loading preferences: {e}")
+        # Use default visualizable fields if error
+        self.selected_fields = self.visualizable_fields.copy()
+
+def save_preferences(self):
+    """Save user preferences to file"""
+    try:
+        # Create preferences directory if it doesn't exist
+        os.makedirs(os.path.dirname(self.preferences_file), exist_ok=True)
+        
+        # Prepare preferences dictionary
+        preferences = {
+            'selected_fields': self.selected_fields,
+            'max_image_size': self.max_image_size,
+            'recursive': self.recursive,
+            'skip_no_exif': self.skip_no_exif,
+            'use_gpu': self.use_gpu,
+            'gpu_image_processing': self.gpu_image_processing,
+            'gpu_data_analysis': self.gpu_data_analysis,
+            'cpu_cores': self.cpu_cores,
+            'memory_limit': self.memory_limit
+        }
+        
+        # Save to file
+        with open(self.preferences_file, 'w') as f:
+            json.dump(preferences, f, indent=2)
+            
+        print(f"Saved preferences to {self.preferences_file}")
+    except Exception as e:
+        print(f"Error saving preferences: {e}")
+
+# Add methods to ExifToolGUI class
+ExifToolGUI.load_preferences = load_preferences
+ExifToolGUI.save_preferences = save_preferences
+
+# Add method for handling column header clicks and sorting
+def on_header_clicked(self, column_index):
+    """Handle column header click to sort the table"""
+    # Get the column name
+    column_name = self.data_table.horizontalHeaderItem(column_index).text()
+    
+    # Toggle sort order for this column
+    if column_index in self.sort_orders:
+        self.sort_orders[column_index] = not self.sort_orders[column_index]
+    else:
+        self.sort_orders[column_index] = True  # Default to ascending first
+    
+    # Determine sort order
+    sort_order = Qt.SortOrder.AscendingOrder if self.sort_orders[column_index] else Qt.SortOrder.DescendingOrder
+    
+    # Sort the table
+    self.data_table.sortItems(column_index, sort_order)
+    
+    # Update status message
+    direction = "ascending" if self.sort_orders[column_index] else "descending"
+    self.status_label.setText(f"Sorted by {column_name} ({direction})")
+
+ExifToolGUI.on_header_clicked = on_header_clicked
 
 
 if __name__ == "__main__":
